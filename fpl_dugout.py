@@ -185,6 +185,266 @@ FIX_GWS = 6
 
 
 # ---------------------------------------------------------------------------
+# Betting odds as a strength signal
+# ---------------------------------------------------------------------------
+# The market prices in squad quality, transfers, suspensions and Friday team news
+# within minutes, and published work finds bookmaker odds better calibrated than
+# statistical models. Where a fixture is priced, its expected goals come from the
+# market. Beyond the market's horizon the results-based ratings take over, and
+# every fixture is labelled with which produced it.
+ODDS_KEY = os.environ.get("ODDS_API_KEY", "").strip()
+ODDS_SPORT = os.environ.get("ODDS_SPORT", "soccer_epl")
+ODDS_REGION = os.environ.get("ODDS_REGION", "uk")
+# 1 credit per market per region. h2h alone determines both goal expectations
+# (three prices, two free parameters, two unknowns), so totals is opt-in.
+ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h")
+ODDS_TTL = int(os.environ.get("ODDS_TTL", "21600"))    # 6 hours
+ODDS_HOST = "https://api.the-odds-api.com"
+
+ODDS_CREDITS_PER_CALL = (len([x for x in ODDS_MARKETS.split(",") if x.strip()])
+                         * len([x for x in ODDS_REGION.split(",") if x.strip()]))
+ODDS_MAX_CALLS = int(os.environ.get("ODDS_MAX_CALLS", "300"))
+_odds_state = {"status": "off", "detail": "no ODDS_API_KEY set",
+               "events": 0, "remaining": None, "fetched": None}
+# deliberately NOT in _cache: pressing Refresh clears that, and odds cost money
+_odds_cache = {"t": 0.0, "data": [], "calls": 0, "month": ""}
+
+
+def _odds_budget_ok():
+    """One hard ceiling per calendar month, so nothing can run the meter away."""
+    mon = time.strftime("%Y-%m")
+    if _odds_cache["month"] != mon:
+        _odds_cache["month"] = mon
+        _odds_cache["calls"] = 0
+    return _odds_cache["calls"] < ODDS_MAX_CALLS
+
+
+def odds_available():
+    return bool(ODDS_KEY)
+
+
+def fetch_odds():
+    """Upcoming priced fixtures. Costs 1 credit per market per region."""
+    if MOCK_DIR:
+        p = os.path.join(MOCK_DIR, "odds.json")
+        if os.path.exists(p):
+            with open(p) as fh:
+                data = json.load(fh)
+            _odds_state.update(status="on", detail="mock odds file",
+                               events=len(data), fetched="mock")
+            return data
+        return []
+    if not ODDS_KEY:
+        return []
+    url = ("%s/v4/sports/%s/odds/?apiKey=%s&regions=%s&markets=%s&oddsFormat=decimal"
+           % (ODDS_HOST, ODDS_SPORT, ODDS_KEY, ODDS_REGION, ODDS_MARKETS))
+    now = time.time()
+    with _lock:
+        if _odds_cache["t"] and now - _odds_cache["t"] < ODDS_TTL:
+            return _odds_cache["data"]
+        if not _odds_budget_ok():
+            _odds_state.update(status="error", detail=(
+                "monthly odds call limit of %d reached; using results instead"
+                % ODDS_MAX_CALLS))
+            return _odds_cache["data"]
+        _odds_cache["calls"] += 1
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            _odds_state["remaining"] = r.headers.get("x-requests-remaining")
+    except urllib.error.HTTPError as e:
+        code = e.code
+        _odds_state.update(status="error", detail=(
+            "the odds key was rejected (HTTP 401)" if code == 401 else
+            "odds quota exhausted (HTTP 429)" if code == 429 else
+            "odds provider returned HTTP %d" % code))
+        return []
+    except Exception as e:                                  # noqa: BLE001
+        _odds_state.update(status="error", detail="could not reach the odds provider (%s)" % e)
+        return []
+    with _lock:
+        _odds_cache["t"] = now
+        _odds_cache["data"] = data
+    _odds_state.update(status="on", detail="", events=len(data),
+                       fetched=time.strftime("%Y-%m-%d %H:%M:%S"))
+    return data
+
+
+# ---- prices -> probabilities -> goal expectations -------------------------
+def devig(prices):
+    """Strip the bookmaker margin. Decimal odds imply 1/price; those sum to more
+    than 1 because the margin is baked in, so divide through by the total."""
+    inv = [(1.0 / p) for p in prices if p and p > 1.0]
+    if len(inv) != len(prices) or not inv:
+        return None
+    tot = sum(inv)
+    return [x / tot for x in inv], tot - 1.0
+
+
+def _poisson_probs(lh, la, maxg=10):
+    ph = [math.exp(-lh) * lh ** i / math.factorial(i) for i in range(maxg + 1)]
+    pa = [math.exp(-la) * la ** i / math.factorial(i) for i in range(maxg + 1)]
+    home = draw = away = 0.0
+    for i in range(maxg + 1):
+        for j in range(maxg + 1):
+            p = ph[i] * pa[j]
+            if i > j:
+                home += p
+            elif i == j:
+                draw += p
+            else:
+                away += p
+    return home, draw, away
+
+
+def goals_from_probs(p_home, p_away, total=None):
+    """Find the goal expectations that reproduce the market's probabilities.
+
+    Two prices carry two degrees of freedom and there are two unknowns, so the
+    pair is determined. Parametrised as total goals and supremacy, both solved
+    by bisection: supremacy is monotone in the home-win probability, and total
+    goals is monotone in the draw probability.
+    """
+    def sup_for(T):
+        lo, hi = -4.0, 4.0
+        for _ in range(45):
+            mid = (lo + hi) / 2.0
+            h, _d, _a = _poisson_probs(max(0.02, (T + mid) / 2.0),
+                                       max(0.02, (T - mid) / 2.0))
+            if h < p_home:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    if total is not None and 0.5 < total < 8:
+        T = total
+        S = sup_for(T)
+    else:
+        target_draw = max(0.01, 1.0 - p_home - p_away)
+        lo, hi = 1.2, 5.5
+        for _ in range(35):
+            T = (lo + hi) / 2.0
+            S = sup_for(T)
+            _h, d, _a = _poisson_probs(max(0.02, (T + S) / 2.0),
+                                       max(0.02, (T - S) / 2.0))
+            if d > target_draw:      # more goals means fewer draws
+                lo = T
+            else:
+                hi = T
+        T = (lo + hi) / 2.0
+        S = sup_for(T)
+    return max(0.05, (T + S) / 2.0), max(0.05, (T - S) / 2.0)
+
+
+def parse_event(ev):
+    """One priced fixture -> expected goals for each side, or None."""
+    home, away = ev.get("home_team"), ev.get("away_team")
+    if not home or not away:
+        return None
+    h2h, totals = [], []
+    for bk in ev.get("bookmakers", []):
+        for mk in bk.get("markets", []):
+            if mk.get("key") == "h2h":
+                o = {x.get("name"): x.get("price") for x in mk.get("outcomes", [])}
+                if home in o and away in o and "Draw" in o:
+                    h2h.append((o[home], o["Draw"], o[away]))
+            elif mk.get("key") == "totals":
+                for x in mk.get("outcomes", []):
+                    if x.get("point") is not None:
+                        totals.append(float(x["point"]))
+    if not h2h:
+        return None
+    # median across bookmakers is more robust than any single price
+    def med(xs):
+        xs = sorted(xs)
+        n = len(xs)
+        return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+    ph = med([x[0] for x in h2h]); pd_ = med([x[1] for x in h2h]); pa = med([x[2] for x in h2h])
+    dv = devig([ph, pd_, pa])
+    if not dv:
+        return None
+    probs, margin = dv
+    total = med(totals) if totals else None
+    lh, la = goals_from_probs(probs[0], probs[2], total)
+    return {"home": home, "away": away, "ko": ev.get("commence_time"),
+            "xgh": round(lh, 3), "xga": round(la, 3),
+            "pHome": round(probs[0], 3), "pDraw": round(probs[1], 3),
+            "pAway": round(probs[2], 3), "margin": round(margin, 4),
+            "books": len(h2h), "totalLine": total}
+
+
+# ---- matching bookmaker names to FPL clubs --------------------------------
+ODDS_ALIASES = {
+    "tottenham hotspur": "spurs", "tottenham": "spurs",
+    "manchester united": "man utd", "manchester city": "man city",
+    "nottingham forest": "nott'm forest", "newcastle united": "newcastle",
+    "leeds united": "leeds", "west ham united": "west ham",
+    "brighton and hove albion": "brighton", "brighton hove albion": "brighton",
+    "wolverhampton wanderers": "wolves", "afc bournemouth": "bournemouth",
+    "sheffield united": "sheffield utd", "luton town": "luton",
+}
+
+
+def _norm(s):
+    s = (s or "").lower().strip()
+    for junk in (" fc", " afc", "."):
+        s = s.replace(junk, " ")
+    return " ".join(s.split())
+
+
+def build_team_index(teams):
+    idx = {}
+    for t in teams:
+        idx[_norm(t["name"])] = t["id"]
+        idx[_norm(t["short_name"])] = t["id"]
+    return idx
+
+
+def match_team(name, idx):
+    n = _norm(name)
+    if n in idx:
+        return idx[n]
+    if ODDS_ALIASES.get(n) and _norm(ODDS_ALIASES[n]) in idx:
+        return idx[_norm(ODDS_ALIASES[n])]
+    # last resort: the FPL name is a distinctive substring of the bookmaker's
+    best, best_len = None, 0
+    for k, v in idx.items():
+        if len(k) >= 4 and (k in n or n in k) and len(k) > best_len:
+            best, best_len = v, len(k)
+    return best
+
+
+def odds_by_fixture(fixtures, teams):
+    """{fpl fixture id: market expectation} for everything the market has priced."""
+    events = fetch_odds()
+    if not events:
+        return {}, []
+    idx = build_team_index(teams)
+    priced, unmatched = {}, []
+    parsed = []
+    for ev in events:
+        p = parse_event(ev)
+        if p:
+            parsed.append(p)
+    for p in parsed:
+        h, a = match_team(p["home"], idx), match_team(p["away"], idx)
+        if not h or not a:
+            unmatched.append("%s v %s" % (p["home"], p["away"]))
+            continue
+        for f in fixtures:
+            if f.get("finished") or f["team_h"] != h or f["team_a"] != a:
+                continue
+            priced[f["id"]] = p
+            break
+    _odds_state["matched"] = len(priced)
+    _odds_state["unmatched"] = unmatched
+    return priced, unmatched
+
+
+# ---------------------------------------------------------------------------
 # Team strength, from results rather than a pre-season opinion
 # ---------------------------------------------------------------------------
 # The FPL difficulty rating is set before a ball is kicked and never moves. These
@@ -254,8 +514,9 @@ def difficulty_from(exp_):
     return 5
 
 
-def build_fixture_map(fixtures, teams, from_gw, strength):
-    """Each team's next FIX_GWS gameweeks, with what the strength model expects."""
+def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
+    """Each team's next FIX_GWS gameweeks, priced by the market where possible."""
+    priced = priced or {}
     gws = list(range(from_gw, from_gw + FIX_GWS))
     out = {}
     short = {t["id"]: t["short_name"] for t in teams}
@@ -266,16 +527,24 @@ def build_fixture_map(fixtures, teams, from_gw, strength):
                      and (f["team_h"] == t["id"] or f["team_a"] == t["id"])]
             if not games:
                 runs.append({"gw": gw, "opp": None, "ha": "-", "fdr": None,
-                             "cs": None, "xgf": None})
+                             "cs": None, "xgf": None, "src": None})
                 continue
             for f in games:
                 home = f["team_h"] == t["id"]
                 opp = f["team_a"] if home else f["team_h"]
-                e = match_expectation(strength, t["id"], opp, home)
+                mk = priced.get(f["id"])
+                if mk:
+                    xgf = mk["xgh"] if home else mk["xga"]
+                    xga = mk["xga"] if home else mk["xgh"]
+                    e = {"xgf": xgf, "xga": xga, "cs": round(math.exp(-xga), 3)}
+                    src = "odds"
+                else:
+                    e = match_expectation(strength, t["id"], opp, home)
+                    src = "form"
                 d = difficulty_from(e)
                 runs.append({"gw": int(gw), "opp": short.get(opp, "?"),
                              "ha": "H" if home else "A", "fdr": d,
-                             "cs": e["cs"], "xgf": e["xgf"]})
+                             "cs": e["cs"], "xgf": e["xgf"], "src": src})
                 diffs.append(d); css.append(e["cs"]); atts.append(e["xgf"])
         out[t["id"]] = {
             "runs": runs,
@@ -640,7 +909,8 @@ def build_payload(entry_id, league_id):
     strength = team_strength(fixtures, boot["teams"])
     matches_played = max([v["played"] for k, v in strength.items()
                           if not str(k).startswith("_")] or [0])
-    fixmap = build_fixture_map(fixtures, boot["teams"], plan_from, strength)
+    priced, odds_unmatched = odds_by_fixture(fixtures, boot["teams"])
+    fixmap = build_fixture_map(fixtures, boot["teams"], plan_from, strength, priced)
 
     # per-gameweek logs for multi-window form, hit rates and real minutes
     last_done = max([e["id"] for e in events if e.get("finished")] or [0])
@@ -876,6 +1146,17 @@ def build_payload(entry_id, league_id):
                                                      x.get("kickoff_time") or ""))
             if f.get("event")],
         "table": league_table(fixtures, boot["teams"]),
+        "odds": {"status": _odds_state.get("status"),
+                 "detail": _odds_state.get("detail"),
+                 "priced": len(priced), "unmatched": odds_unmatched,
+                 "remaining": _odds_state.get("remaining"),
+                 "callsThisMonth": _odds_cache["calls"],
+                 "perCall": ODDS_CREDITS_PER_CALL,
+                 "markets": ODDS_MARKETS,
+                 "creditsThisMonth": _odds_cache["calls"] * ODDS_CREDITS_PER_CALL,
+                 "maxCalls": ODDS_MAX_CALLS,
+                 "fetched": _odds_state.get("fetched"),
+                 "ttlHours": round(ODDS_TTL / 3600.0, 1)},
         "strength": {str(k): v for k, v in strength.items() if not str(k).startswith("_")},
         "leagueAvgGoals": round(strength["_avg"], 3),
         "horizon": HORIZON,
@@ -1369,6 +1650,13 @@ tbody tr.open td{background:var(--accent-soft)}
   font-weight:600;flex:none;text-align:center;min-width:56px}
 .fxrow .mid small{display:block;font-size:9.5px;font-weight:400;color:var(--muted)}
 .fxrow.done .mid{font-size:15px}
+/* fixtures priced by the betting market carry a top edge */
+.fx.mkt{box-shadow:inset 0 2.5px 0 var(--accent)}
+.oddsbadge{display:inline-flex;align-items:center;gap:5px;font-family:"IBM Plex Mono",monospace;
+  font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);
+  background:var(--accent-soft);border:1px solid var(--accent);border-radius:20px;
+  padding:2px 8px}
+.oddsbadge.off{color:var(--muted);background:var(--sunk);border-color:var(--line)}
 footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px solid var(--line);margin-top:28px}
 </style>
 </head>
@@ -1535,7 +1823,12 @@ function fixStrip(short,n){
   return '<div class="fixrow">'+runs.map(function(r){
     if(!r.opp) return '<div class="fx fdr3"><span class="g">GW'+r.gw+'</span>'+
       '<span class="o">—</span><span class="n">no game</span></div>';
-    return '<div class="fx '+fdrCls(r.fdr)+'"><span class="g">GW'+r.gw+' '+r.ha+'</span>'+
+    var mkt=r.src==="odds";
+    return '<div class="fx '+fdrCls(r.fdr)+(mkt?' mkt':'')+'" title="'+
+      (mkt?'Priced by the betting market':'From results so far')+
+      ' — expected goals '+(r.xgf==null?'?':r.xgf.toFixed(2))+
+      ', clean sheet '+(r.cs==null?'?':Math.round(r.cs*100)+'%')+'">'+
+      '<span class="g">GW'+r.gw+' '+r.ha+'</span>'+
       '<span class="o">'+esc(r.opp)+'</span><span class="n">Diff '+r.fdr+'</span></div>'
   }).join("")+'</div>';
 }
@@ -1586,16 +1879,26 @@ function obsSentence(p){
   return "For forwards: 55% goals+assists expected per 90 ("+p.xgi90.toFixed(2)+
     ") and 45% recent scoring rate ("+f+" a game).";
 }
+function oddsNote(){
+  var o=D.odds||{};
+  if(o.status==="on"&&o.priced)
+    return " "+o.priced+" of the coming fixtures are priced by the betting market, and "+
+      "those use the market's numbers instead — fixtures with a blue top edge.";
+  if(o.status==="error")
+    return " Betting odds are configured but unavailable right now ("+esc(o.detail||"")+
+      "), so every fixture is using results.";
+  return "";
+}
 function fixSentence(p){
   if(p.pos==="GK"||p.pos==="DEF")
     return "Because clean sheets are what pays at the back, the fixture term is his chance "+
       "of keeping one across the next six — "+
       (p.csNext==null?"not yet computed":Math.round(p.csNext*100)+"%")+
-      " on average, from a Poisson model of both clubs\u2019 records so far.";
+      " on average, from a Poisson model of both clubs\u2019 records so far."+oddsNote();
   return "Because goals are what pays further forward, the fixture term is how many goals "+
     "his side is expected to score across the next six — "+
     (p.xgfNext==null?"not yet computed":p.xgfNext.toFixed(2)+" a game")+
-    ", from both clubs\u2019 records so far plus home advantage.";
+    ", from both clubs\u2019 records so far plus home advantage."+oddsNote();
 }
 function explainHTML(p){
   var w=D.meta.model, x=p.expl;
@@ -1815,7 +2118,9 @@ function renderClubs(){
   var counts=M().clubCountsById||{};
   $("#p-clubs").innerHTML=intro('Three things here: the <b>league table</b> worked out from '+
     'results so far, <b>every fixture</b> gameweek by gameweek, and each club\u2019s players '+
-    'ranked by rating. Click a club to see who is worth owning there.')+
+    'ranked by rating. Click a club to see who is worth owning there.'+
+    ((D.odds&&D.odds.status==="on"&&D.odds.priced)
+      ? ' Fixtures with a blue top edge are priced by the betting market.' : ''))+
     fixturesHTML()+tableHTML()+
     '<h4 class="seclab">Squads<i></i></h4><div class="clubgrid">'+D.clubs.map(function(c){
     var owned=counts[String(c.id)]||0;
@@ -2297,6 +2602,35 @@ function renderModel(){
   'scored for midfielders and forwards. The 1–5 difficulty you see on fixture strips is '+
   'derived from that model, not from the published rating.</p>'+
 
+  '<h3>Betting odds</h3>'+
+  (function(){
+    var o=D.odds||{};
+    if(o.status==="on"&&o.priced)
+      return '<p><span class="oddsbadge">market on</span> '+o.priced+' upcoming fixture'+
+        (o.priced===1?'':'s')+' are priced by the betting market, and those use the '+
+        'market\u2019s expected goals rather than the ratings above. Fixtures beyond the '+
+        'market\u2019s horizon fall back to results. Prices are refreshed every '+
+        o.ttlHours+' hours, costing '+o.perCall+' credit'+(o.perCall===1?'':'s')+' a time'+(o.remaining?', '+esc(o.remaining)+' left on the provider\u2019s counter':'')+
+        '. This app has spent <b>'+(o.creditsThisMonth||0)+' credit'+
+        ((o.creditsThisMonth||0)===1?'':'s')+'</b> this month against a free allowance of '+
+        '500, and cannot exceed '+(o.maxCalls*o.perCall)+' whatever happens. The Refresh button '+
+        'deliberately cannot buy new odds.</p>';
+    if(o.status==="error")
+      return '<p><span class="oddsbadge off">market unavailable</span> Odds are configured '+
+        'but could not be read ('+esc(o.detail||"")+'), so every fixture is priced from '+
+        'results. Nothing is broken — this is the intended fallback.</p>';
+    return '<p><span class="oddsbadge off">market off</span> No odds key is configured, so '+
+      'fixtures are priced entirely from results. Betting markets absorb squad quality, '+
+      'transfers and team news within minutes, and published work finds them better '+
+      'calibrated than statistical models — so adding a key would improve this most in '+
+      'August, when there are barely any results to learn from.</p>';
+  })()+
+  '<p>Where the market is used, the three prices for a match are stripped of the '+
+  'bookmaker\u2019s margin, then the pair of goal expectations that reproduces those '+
+  'probabilities is solved for. Two prices carry two degrees of freedom and there are two '+
+  'unknowns, so the answer is determined rather than fitted. Clean-sheet chance follows '+
+  'from the same numbers.</p>'+
+
   '<h3>Minutes</h3>'+
   '<p>Minutes are the most reliable thing in fantasy football: they happen every week, so '+
   'they settle down long before goals do. Expected minutes come from the recent match log '+
@@ -2312,6 +2646,9 @@ function renderModel(){
   'is established in the football-analytics literature. And the Premier League’s own data '+
   'shows defensive-actions hit rates near 70% for the best specialists against roughly 40% '+
   'for attacking midfielders, which is a far more repeatable signal than goalscoring.</p>'+
+  '<p>On the market: a 2026 study comparing simple models with bookmaker prices in the '+
+  'Bundesliga found the odds better calibrated on both log-loss and Brier scores, which is '+
+  'why they take precedence here wherever a fixture has been priced.</p>'+
   '<p><b>An honest ceiling.</b> OpenFPL is a trained ensemble on four seasons and still has '+
   'a root-mean-square error of about 5 points on the players who actually haul. This is a '+
   'hand-built heuristic, not a trained model, so treat it as a way of ranking options and '+
