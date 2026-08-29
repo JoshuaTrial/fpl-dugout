@@ -399,23 +399,29 @@ def slim(e, teams):
 
 
 def reasons(p):
+    """Why a player rates well: plain wording, but with the number that backs it up.
+    Readable without a glossary, still specific enough to argue with."""
     out = []
     if p["pen"] == 1:
-        out.append("first-choice penalties")
+        out.append("first on penalties")
     if p["xgi90"] >= 0.45:
-        out.append("xGI/90 %.2f" % p["xgi90"])
+        out.append("%.2f goals+assists expected per 90" % p["xgi90"])
     thr = DC_THRESH.get(p["pos"], 12)
     if p["pos"] != "GK" and p["dc90"] >= thr:
-        out.append("cleared DEFCON (%d vs %d)" % (int(p["dc90"]), thr))
+        out.append("%d defensive actions per 90, needs %d" % (int(p["dc90"]), thr))
     if p["avgFdr"] is not None and p["avgFdr"] <= 2.85:
-        out.append("kind run (FDR %.2f)" % p["avgFdr"])
+        out.append("easy fixtures, difficulty %.2f" % p["avgFdr"])
+    if p["pos"] in ("GK", "DEF") and p["mins"] and p["xgc"] and \
+            (p["xgc"] / (p["mins"] / 90.0)) <= 0.9:
+        out.append("%.2f goals conceded expected per 90"
+                   % (p["xgc"] / (p["mins"] / 90.0)))
     if p["owned"] <= 5 and p["score"] >= 70:
-        out.append("differential (%.1f%% owned)" % p["owned"])
+        out.append("owned by just %.1f%%" % p["owned"])
     if p["mins"] >= 90 and p["starts"] >= 1:
-        out.append("%d mins, %d start%s" % (p["mins"], p["starts"],
-                                            "" if p["starts"] == 1 else "s"))
+        out.append("%d minutes, %d start%s" % (p["mins"], p["starts"],
+                                               "" if p["starts"] == 1 else "s"))
     if p["ck"] == 1 or p["fk"] == 1:
-        out.append("on set pieces")
+        out.append("on corners or free-kicks")
     return out[:3]
 
 
@@ -655,6 +661,15 @@ def build_payload(entry_id, league_id):
         "managers": managers,
         "players": players,
         "clubs": clubs,
+        "allFixtures": [
+            {"gw": f.get("event"), "ko": f.get("kickoff_time"),
+             "h": f["team_h"], "a": f["team_a"],
+             "hs": f.get("team_h_score"), "as": f.get("team_a_score"),
+             "fin": bool(f.get("finished")),
+             "hd": f.get("team_h_difficulty"), "ad": f.get("team_a_difficulty")}
+            for f in sorted(fixtures, key=lambda x: ((x.get("event") or 99),
+                                                     x.get("kickoff_time") or ""))
+            if f.get("event")],
         "table": league_table(fixtures, boot["teams"]),
         "horizon": HORIZON,
         "fixtures": {teams[k]["short_name"]: v for k, v in fixmap.items()},
@@ -813,7 +828,7 @@ h1{font-size:24px;font-weight:800}
 .tab:hover{color:var(--ink)}
 .tab[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
 .panel[hidden]{display:none}
-main{padding-top:20px}
+main{padding-top:24px}
 
 .msg{border-radius:var(--r);padding:14px 16px;margin-bottom:18px;font-size:14px}
 .msg.err{background:var(--bad-bg);border:1px solid var(--bad);color:var(--ink)}
@@ -1093,6 +1108,60 @@ tbody tr.open td{background:var(--accent-soft)}
 .clubcell .bw{width:22px;height:22px}
 .capcard .caphead{display:flex;gap:11px;align-items:center;margin-bottom:9px}
 .capcard .caphead .pw{margin:0}
+/* orientation line at the top of every tab */
+.tabintro{color:var(--muted);font-size:13.5px;margin:4px 0 18px;max-width:78ch;line-height:1.55}
+.tabintro b{color:var(--ink2);font-weight:600}
+/* home */
+.hero{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:18px 20px;margin-bottom:14px;box-shadow:var(--shadow);
+  display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+.hero h2{font-size:23px;line-height:1.15}
+.hero .when{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--muted)}
+.hero .standing{margin-left:auto;font-size:13.5px;color:var(--ink2)}
+.hero .standing b{font-family:Archivo,sans-serif;font-size:17px;color:var(--ink)}
+.acts{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px}
+.act{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:15px 17px;box-shadow:var(--shadow);display:flex;flex-direction:column}
+.act .kicker{font-family:"IBM Plex Mono",monospace;font-size:9.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:7px;font-weight:600}
+.act h3{font-size:17px;line-height:1.25;margin-bottom:5px}
+.act .body{font-size:13.5px;color:var(--ink2);flex:1;margin-bottom:12px}
+.act .faces{display:flex;align-items:center;gap:9px;margin-bottom:9px}
+.act .faces .pw{margin:0;width:34px;height:34px}
+.act .arrow{color:var(--accent);font-family:Archivo,sans-serif;font-weight:800}
+.act .go{align-self:flex-start;appearance:none;background:var(--sunk);border:1px solid var(--line);
+  border-radius:7px;padding:7px 12px;font-family:Archivo,sans-serif;font-weight:600;
+  font-size:13px;color:var(--accent);cursor:pointer}
+.act .go:hover{background:var(--accent-soft);border-color:var(--accent)}
+.act.warn{border-color:var(--warn)}
+.act.warn .kicker{color:var(--warn)}
+.act.calm{border-color:var(--good)}
+.act.calm .kicker{color:var(--good)}
+.flaglist{list-style:none;margin:0;padding:0}
+.flaglist li{padding:5px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.flaglist li:last-child{border-bottom:0}
+.flaglist b{font-family:Archivo,sans-serif}
+/* fixtures */
+.gwbar{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.gwbar .nav{appearance:none;width:32px;height:32px;border-radius:7px;border:1px solid var(--line);
+  background:var(--card);cursor:pointer;font-size:14px;color:var(--ink2);display:grid;place-items:center}
+.gwbar .nav:hover{border-color:var(--accent);color:var(--accent)}
+.gwbar .nav[disabled]{opacity:.35;cursor:default}
+.gwbar .lbl{font-family:Archivo,sans-serif;font-weight:800;font-size:17px;min-width:118px}
+.gwbar .sub{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted)}
+.fixlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:8px;
+  margin-bottom:20px}
+.fxrow{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 12px;
+  display:flex;align-items:center;gap:9px;font-size:13.5px}
+.fxrow .side{display:flex;align-items:center;gap:7px;flex:1;min-width:0}
+.fxrow .side.away{flex-direction:row-reverse;text-align:right}
+.fxrow .side .bw{width:20px;height:20px}
+.fxrow .side b{font-family:Archivo,sans-serif;font-weight:700;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.fxrow .mid{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;
+  font-weight:600;flex:none;text-align:center;min-width:56px}
+.fxrow .mid small{display:block;font-size:9.5px;font-weight:400;color:var(--muted)}
+.fxrow.done .mid{font-size:15px}
 footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px solid var(--line);margin-top:28px}
 </style>
 </head>
@@ -1113,13 +1182,22 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
     </div>
     <div class="strip" id="strip"></div>
     <div class="tabs" role="tablist" id="tabs">
-      <button class="tab" role="tab" aria-selected="true" data-p="squad">My Team</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="tx">Transfers</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="clubs">Clubs</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="players">Players</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="cap">Captaincy</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="league">League</button>
-      <button class="tab" role="tab" aria-selected="false" data-p="model">Model</button>
+      <button class="tab" role="tab" aria-selected="true" data-p="home"
+        title="What to do this week, at a glance">Home</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="squad"
+        title="Your squad on the pitch. Click any player for his stats and who could replace him.">My Team</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="tx"
+        title="The swaps that gain the most over the next five matches">Transfers</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="clubs"
+        title="League table, all fixtures, and every club's players">Clubs &amp; Fixtures</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="players"
+        title="Search and compare every player in the game">Players</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="cap"
+        title="Who to give the armband to this week">Captain</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="league"
+        title="Your mini-league table, everyone's teams, and who owns what">My League</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="model"
+        title="How the ratings are worked out, in plain English">How it works</button>
     </div>
   </div>
 </div>
@@ -1128,7 +1206,9 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
   <div id="app" hidden>
     <div id="banner"></div>
     <section id="picker" hidden></section>
-    <section class="panel" id="p-squad">
+    <section class="panel" id="p-home"></section>
+    <section class="panel" id="p-squad" hidden>
+      <div id="squadintro"></div>
       <div class="squadgrid">
         <div><div class="pitch" id="pitch"></div></div>
         <div class="card dt" id="detail"></div>
@@ -1146,8 +1226,8 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
 <script>
 (function(){
 "use strict";
-var TABS=["squad","tx","clubs","players","cap","league","model"];
-var D=null, byId={}, viewEntry=null, curClub=null,
+var TABS=["home","squad","tx","clubs","players","cap","league","model"];
+var D=null, byId={}, viewEntry=null, curClub=null, gwView=null,
     sortKey="score", sortDir=-1, openPlayer=null;
 
 function $(s,r){return (r||document).querySelector(s)}
@@ -1189,11 +1269,14 @@ function photoHTML(p,big){
     '/p'+p.code+'.png" alt=""><span class="pfb imgfb">'+esc(initials(p.name))+'</span></span>';
 }
 function badgeHTML(code,short,lg){
+  // the club's name always sits next to the badge, so the no-image fallback is a single
+  // letter rather than the code -- otherwise it reads as "ARSARS"
   var cls="bw"+(lg?" lg":"");
-  if(!code) return '<span class="'+cls+'"><span class="bfb imgfb" style="display:block">'+
-    esc(short)+'</span></span>';
+  var fb=esc(String(short||"?").charAt(0));
+  if(!code) return '<span class="'+cls+'"><span class="bfb imgfb" style="display:block" '+
+    'title="'+esc(short)+'">'+fb+'</span></span>';
   return '<span class="'+cls+'"><img class="fbimg" src="'+BADGE+code+'.png" alt="">'+
-    '<span class="bfb imgfb">'+esc(short)+'</span></span>';
+    '<span class="bfb imgfb" title="'+esc(short)+'">'+fb+'</span></span>';
 }
 function wireImgs(root){
   all("img.fbimg",root||document).forEach(function(im){
@@ -1244,16 +1327,16 @@ function fixStrip(short,n){
   }
   return '<div class="fixrow">'+runs.map(function(r){
     if(!r.opp) return '<div class="fx fdr3"><span class="g">GW'+r.gw+'</span>'+
-      '<span class="o">—</span><span class="n">blank</span></div>';
+      '<span class="o">—</span><span class="n">no game</span></div>';
     return '<div class="fx '+fdrCls(r.fdr)+'"><span class="g">GW'+r.gw+' '+r.ha+'</span>'+
-      '<span class="o">'+esc(r.opp)+'</span><span class="n">FDR '+r.fdr+'</span></div>'
+      '<span class="o">'+esc(r.opp)+'</span><span class="n">Diff '+r.fdr+'</span></div>'
   }).join("")+'</div>';
 }
 function statGrid(p){
   var rows=[["Pts",p.pts],["Mins",p.mins],["Starts",p.starts],["Form",p.form.toFixed(1)],
     ["PPG",p.ppg.toFixed(1)],["Goals",p.goals],["Assists",p.assists],["Bonus",p.bonus],
     ["xG",p.xg.toFixed(2)],["xA",p.xa.toFixed(2)],["xGI/90",p.xgi90.toFixed(2)],
-    ["xGC",p.xgc.toFixed(2)],["ICT",p.ict],["BPS",p.bps],["DefCon",p.dc],
+    ["xGC",p.xgc.toFixed(2)],["ICT",p.ict],["BPS",p.bps],["Def. actions",p.dc],
     ["Owned",p.owned+"%"]];
   return '<div class="stats">'+rows.map(function(r){
     return '<div class="st"><span class="k">'+esc(r[0])+'</span><span class="v">'+
@@ -1268,7 +1351,7 @@ function pillsFor(p){
   if(p.ck===1) o.push('<span class="pill">Corners · 1st</span>');
   if(p.fk===1) o.push('<span class="pill">Free-kicks · 1st</span>');
   if(p.avgFdr!=null) o.push('<span class="pill'+(p.avgFdr<=2.8?" good":p.avgFdr>=3.4?" bad":"")+
-    '">Next 6 · FDR '+p.avgFdr.toFixed(2)+'</span>');
+    '" title="Average difficulty of the next six matches. 1 is the easiest fixture, 5 the hardest.">Next 6 · difficulty '+p.avgFdr.toFixed(2)+'</span>');
   if(p.owned<=5) o.push('<span class="pill">Differential · '+p.owned+'% owned</span>');
   if(p.costChange!==0) o.push('<span class="pill">Price '+(p.costChange>0?"+":"")+
     (p.costChange/10).toFixed(1)+'m since start</span>');
@@ -1299,20 +1382,21 @@ function explainHTML(p){
       '</td><td class="r">'+res+'</td></tr>';
   }
   var h='<h5>How this score was built</h5><table class="calc">';
-  h+=row("Price prior",x.prior.toFixed(2)+" × "+Math.round(w.wPrior*100)+"%",a.toFixed(1));
-  h+=row("Observed form",x.obs.toFixed(2)+" × "+Math.round(w.wObs*100)+"%",b.toFixed(1));
+  h+=row("Price signal",x.prior.toFixed(2)+" × "+Math.round(w.wPrior*100)+"%",a.toFixed(1));
+  h+=row("Recent form",x.obs.toFixed(2)+" × "+Math.round(w.wObs*100)+"%",b.toFixed(1));
   h+=row("Fixtures",x.fix.toFixed(2)+" × "+Math.round(w.wFix*100)+"%",c.toFixed(1));
   h+=row("Subtotal","",sub.toFixed(1),"sum");
   h+=row("× availability","× "+x.avail.toFixed(2),av.toFixed(1));
   h+=row("× minutes played","× "+x.minfac.toFixed(2),mn.toFixed(1));
   h+=row("+ set pieces","+ "+x.sp.toFixed(1),tot.toFixed(1));
-  h+=row("Model score","",Math.round(tot),"tot");
-  h+='</table><p><b>Price prior '+x.prior.toFixed(2)+'</b> means he is priced above '+
+  h+=row("Rating","",Math.round(tot),"tot");
+  h+='</table><p><b>Price signal '+x.prior.toFixed(2)+'</b> means he is priced above '+
     Math.round(x.prior*100)+'% of '+esc(p.pos)+'s. With so little football played, price is '+
     'the steadiest signal available, so it carries the most weight. '+
-    '<b>Observed form '+x.obs.toFixed(2)+'</b> is his percentile on what actually matters for '+
+    '<b>Recent form '+x.obs.toFixed(2)+'</b> is where he ranks on what actually matters for '+
     'his position. '+esc(obsSentence(p))+' <b>Fixtures '+x.fix.toFixed(2)+'</b> comes from an '+
-    'average FDR of '+(p.avgFdr==null?"—":p.avgFdr.toFixed(2))+' over the next six.';
+    'average difficulty of '+(p.avgFdr==null?"—":p.avgFdr.toFixed(2))+
+    ' over the next six, where 1 is the easiest fixture and 5 the hardest.';
   if(x.avail<1) h+=' Availability is below 1.00 because he is flagged, which scales the whole '+
     'score down.';
   if(x.minfac<1) h+=' Minutes security is '+x.minfac.toFixed(2)+' because he has played '+
@@ -1327,9 +1411,9 @@ function altBlock(o,ownerLabel){
   var p=P(o.id), up=o.delta>0;
   return '<div class="altrow"><button class="alt" data-look="'+o.id+'">'+
     '<span class="d '+(up?"up":"dn")+'">'+(up?"+":"")+o.delta.toFixed(1)+
-    '<small>score</small></span><span class="body"><span class="t">'+esc(p.name)+
+    '<small>rating</small></span><span class="body"><span class="t">'+esc(p.name)+
     ' <em>'+esc(p.club)+' · '+m(p.price)+(o.spare>0?' · '+m(o.spare)+' left':'')+
-    '</em></span><span class="w">'+esc((o.why||[]).join(" · ")||"ranked on model score")+
+    '</em></span><span class="w">'+esc(plainWhy(o.why||[]).join(" · ")||"rated higher overall")+
     '</span></span></button>'+
     '<button class="qmark" data-explain="'+o.id+'" aria-expanded="false" '+
     'title="How this score was calculated" aria-label="Explain the score for '+esc(p.name)+'">?</button>'+
@@ -1343,7 +1427,7 @@ function detailFor(id){
     '<div class="sub">'+esc(p.clubFull)+' · '+esc(p.pos)+' · '+m(p.price)+
     (pk?' · sells for '+m(pk.sell):'')+'</div></div></div>'+
     '<div class="scorebox"><div class="n">'+Math.round(p.score)+'</div>'+
-    '<div class="l">Model score</div></div></div>';
+    '<div class="l">Rating</div></div></div>';
   h+=pillsFor(p)+statGrid(p);
   h+='<h4 class="seclab">Next six fixtures<i></i></h4>'+fixStrip(p.club);
   if(pk&&pk.alts){
@@ -1390,6 +1474,11 @@ function renderSquad(){
   h+='<div class="row">'+bn.map(chip).join("")+'</div>';
   $("#pitch").innerHTML=h;
   wireImgs($("#pitch"));
+  var g=$("#squadintro");
+  if(g) g.innerHTML=intro('The fifteen '+esc(mm.team)+' picked, in formation. '+
+    '<b>Click any player</b> to see his numbers and the players you could afford to '+
+    'bring in instead. C is the captain, V the vice-captain, and a red or amber dot '+
+    'means a fitness doubt.');
   detailFor(sq[0].id);
 }
 
@@ -1420,9 +1509,16 @@ function showApp(entry){
   $("#viewbar").hidden=false;
   renderAll();
   all(".tab").forEach(function(x){
-    x.setAttribute("aria-selected",String(x.dataset.p==="squad"))});
+    x.setAttribute("aria-selected",String(x.dataset.p==="home"))});
   TABS.forEach(function(k){
-    document.getElementById("p-"+k).hidden=(k!=="squad")});
+    document.getElementById("p-"+k).hidden=(k!=="home")});
+}
+function goTab(k){
+  all(".tab").forEach(function(x){
+    x.setAttribute("aria-selected",String(x.dataset.p===k))});
+  TABS.forEach(function(t){document.getElementById("p-"+t).hidden=(t!==k)});
+  $("#picker").hidden=true;
+  window.scrollTo({top:0,behavior:"smooth"});
 }
 
 /* ---------------- Clubs ---------------- */
@@ -1454,20 +1550,57 @@ function tableHTML(){
         '</span></td></tr>'
     }).join("")+'</tbody></table></div>';
 }
+function fixturesHTML(){
+  var all=D.allFixtures||[];
+  if(!all.length) return "";
+  var gws=[]; all.forEach(function(f){if(gws.indexOf(f.gw)<0) gws.push(f.gw)});
+  gws.sort(function(a,b){return a-b});
+  if(gwView==null||gws.indexOf(gwView)<0) gwView=D.meta.planFrom;
+  if(gws.indexOf(gwView)<0) gwView=gws[0];
+  var i=gws.indexOf(gwView);
+  var rows=all.filter(function(f){return f.gw===gwView});
+  var tm={}; D.clubs.forEach(function(c){tm[c.id]=c});
+  var done=rows.filter(function(f){return f.fin}).length;
+  return '<h4 class="seclab">All fixtures<i></i></h4>'+
+    '<div class="gwbar">'+
+    '<button class="nav" data-gw="'+(i>0?gws[i-1]:"")+'"'+(i>0?"":" disabled")+
+      ' aria-label="Previous gameweek">‹</button>'+
+    '<span class="lbl">Gameweek '+gwView+'</span>'+
+    '<button class="nav" data-gw="'+(i<gws.length-1?gws[i+1]:"")+'"'+
+      (i<gws.length-1?"":" disabled")+' aria-label="Next gameweek">›</button>'+
+    '<span class="sub">'+rows.length+' match'+(rows.length===1?"":"es")+
+    (done?' · '+done+' played':'')+(gwView===D.meta.planFrom?' · next up':'')+'</span></div>'+
+    '<div class="fixlist">'+rows.map(function(f){
+      var H=tm[f.h]||{}, A=tm[f.a]||{};
+      var mid = f.fin && f.hs!=null
+        ? '<span class="mid">'+f.hs+' – '+f.as+'</span>'
+        : '<span class="mid">v<small>'+(f.ko
+            ? new Date(f.ko).toLocaleString(undefined,{weekday:"short",hour:"2-digit",
+                minute:"2-digit"})
+            : "TBC")+'</small></span>';
+      return '<div class="fxrow'+(f.fin?" done":"")+'">'+
+        '<span class="side">'+badgeHTML(H.code,H.short,false)+'<b>'+esc(H.short||"?")+
+        '</b></span>'+mid+'<span class="side away">'+badgeHTML(A.code,A.short,false)+
+        '<b>'+esc(A.short||"?")+'</b></span></div>'
+    }).join("")+'</div>';
+}
 function renderClubs(){
   var counts=M().clubCountsById||{};
-  $("#p-clubs").innerHTML=tableHTML()+
+  $("#p-clubs").innerHTML=intro('Three things here: the <b>league table</b> worked out from '+
+    'results so far, <b>every fixture</b> gameweek by gameweek, and each club\u2019s players '+
+    'ranked by rating. Click a club to see who is worth owning there.')+
+    fixturesHTML()+tableHTML()+
     '<h4 class="seclab">Squads<i></i></h4><div class="clubgrid">'+D.clubs.map(function(c){
     var owned=counts[String(c.id)]||0;
     return '<button class="clubbtn" data-club="'+c.id+'" aria-pressed="'+(curClub===c.id)+'">'+
       badgeHTML(c.code,c.short,false)+'<b>'+esc(c.short)+'</b><em>'+esc(c.name)+'</em>'+
-      '<em>FDR '+(c.avgFdr==null?"—":c.avgFdr.toFixed(2))+(owned?' · '+owned+' owned':'')+
+      '<em title="Average difficulty of this club\u2019s next six matches: 1 easiest, 5 hardest">Diff '+(c.avgFdr==null?"—":c.avgFdr.toFixed(2))+(owned?' · '+owned+' owned':'')+
       '</em></button>'
   }).join("")+'</div><div id="clubdetail"></div>';
   wireImgs($("#p-clubs"));
   if(curClub!=null) renderClubDetail(curClub);
-  else $("#clubdetail").innerHTML='<p class="emptynote">Pick a club to see every FPL-listed '+
-    'player in that squad, ranked by model score.</p>';
+  else $("#clubdetail").innerHTML='<p class="emptynote">Pick a club to see every '+
+    'player that club has in the game, ranked by rating.</p>';
 }
 function renderClubDetail(cid){
   var c=null; D.clubs.forEach(function(x){if(x.id===cid) c=x});
@@ -1482,7 +1615,7 @@ function renderClubDetail(cid){
     '<h4 class="seclab">Squad, ranked by model score<i></i></h4>'+
     '<div class="tblwrap"><table><thead><tr><th>Player</th><th>Pos</th>'+
     '<th class="num">Price</th><th class="num">Pts</th><th class="num">Mins</th>'+
-    '<th class="num">xGI/90</th><th class="num">DefCon/90</th><th class="num">Owned</th>'+
+    '<th class="num">xGI/90</th><th class="num" title="Tackles, blocks, interceptions, clearances and recoveries per 90 minutes. Hit the threshold in a match and it is worth 2 points.">Def. actions /90</th><th class="num">Owned</th>'+
     '<th class="num">Score</th><th>Notes</th></tr></thead><tbody>'+
     c.squad.map(function(pid){
       var p=P(pid), notes=[];
@@ -1505,9 +1638,11 @@ function renderClubDetail(cid){
 /* ---------------- Players ---------------- */
 var COLS=[["name","Player",0],["club","Club",0],["pos","Pos",0],["price","Price",1],
   ["pts","Pts",1],["mins","Mins",1],["form","Form",1],["xgi90","xGI/90",1],
-  ["dc90","DefCon/90",1],["owned","Owned",1],["score","Score",1]];
+  ["dc90","Def. actions /90",1],["owned","Owned",1],["score","Score",1]];
 function renderPlayersShell(){
-  $("#p-players").innerHTML=
+  $("#p-players").innerHTML=intro('Every player in the game. Narrow the list with the '+
+    'filters, sort by tapping any column heading, then <b>click a row</b> to open that '+
+    'player without leaving this page.')+
     '<div class="filters">'+
     '<div class="fgroup"><label for="q">Search</label>'+
     '<input type="search" id="q" placeholder="name or club"></div>'+
@@ -1545,7 +1680,7 @@ function playerExpansion(p){
   return '<div class="expbox"><div class="expgrid">'+photoHTML(p,true)+
     '<div class="expname"><h3>'+esc(p.full||p.name)+'</h3>'+
     '<div class="sub">'+esc(p.clubFull)+' · '+esc(p.pos)+' · '+m(p.price)+
-    ' · model score '+Math.round(p.score)+'</div>'+pillsFor(p)+'</div></div>'+
+    ' · rating '+Math.round(p.score)+'</div>'+pillsFor(p)+'</div></div>'+
     statGrid(p)+
     '<div class="exptwo"><div><h4 class="seclab">Next six fixtures<i></i></h4>'+
     fixStrip(p.club)+'</div><div class="explain" style="border-radius:8px;border-top-width:1px">'+
@@ -1603,7 +1738,11 @@ function renderCap(){
   var maxScore=Math.max.apply(null,sc);
   var maxX=Math.max.apply(null,caps.map(function(c){return P(c.id).xgi90}))||1;
   var maxF=Math.max.apply(null,caps.map(function(c){return P(c.id).form}))||1;
-  $("#p-cap").innerHTML='<div class="msg info">Ranked from '+esc(mm.team)+
+  $("#p-cap").innerHTML=intro('Your captain scores double, so this is usually the biggest '+
+    'single decision of the week. Options are ranked from the players already in '+
+    esc(mm.team)+'\u2019s starting eleven. <b>Rivals own</b> tells you whether a big score '+
+    'would gain you ground or simply keep pace.')+
+    '<div class="msg info">Ranked from '+esc(mm.team)+
     '’s current starting XI for GW'+D.meta.planFrom+'. Bars are relative to the best '+
     'candidate in that squad, not the whole game — this answers "who of theirs", not '+
     '"who in FPL".</div><div class="capgrid">'+caps.map(function(c,i){
@@ -1620,9 +1759,9 @@ function renderCap(){
         esc(p.clubFull)+' · '+esc(p.pos)+' · '+m(p.price)+'</div></div></div>'+
         '<div class="fixrow" style="margin-bottom:11px"><div class="fx '+fdrCls(f.fdr)+
         '" style="min-width:0"><span class="g">GW'+(f.gw||"")+' '+(f.ha||"")+'</span>'+
-        '<span class="o">'+esc(f.opp||"—")+'</span><span class="n">FDR '+
+        '<span class="o">'+esc(f.opp||"—")+'</span><span class="n">Diff '+
         (f.fdr==null?"—":f.fdr)+'</span></div></div><div class="capbars">'+
-        bar("Model score",p.score,maxScore,Math.round(p.score))+
+        bar("Rating",p.score,maxScore,Math.round(p.score))+
         bar("xGI / 90",p.xgi90,maxX,p.xgi90.toFixed(2))+
         bar("Form",p.form,maxF,p.form.toFixed(1))+
         bar("Rivals own",c.rivalsOwning,c.leagueSize,c.rivalsOwning+"/"+c.leagueSize)+
@@ -1635,6 +1774,125 @@ function renderCap(){
   wireImgs($("#p-cap"));
 }
 
+/* ---------------- plain English ---------------- */
+function plainWhy(list){
+  // reasons now arrive readable and with their numbers; this only rewrites the few
+  // shorthand forms an older build could still be serving
+  return (list||[]).map(function(w){
+    if(/first-choice penalties/.test(w)) return "first on penalties";
+    if(/cleared DEFCON \((\d+)/.test(w))
+      return w.replace(/cleared DEFCON \((\d+) vs (\d+)\)/,
+                       "$1 defensive actions per 90, threshold is $2");
+    if(/^kind run \(/.test(w)) return w.replace(/^kind run \((?:FDR |difficulty )?/, "easy run, difficulty ")
+                                        .replace(/\)$/, " over six");
+    if(/^low xGC/.test(w)) return w.replace(/^low xGC \(([\d.]+)\/90\)/,
+      "tight defence, $1 goals conceded expected per 90");
+    if(/^differential \(([\d.]+)% owned\)/.test(w))
+      return w.replace(/^differential \(([\d.]+)% owned\)/, "owned by just $1%");
+    if(/^xGI\/90 ([\d.]+)/.test(w))
+      return w.replace(/^xGI\/90 ([\d.]+)/, "$1 goals+assists expected per 90");
+    if(/on set pieces/.test(w)) return "on corners or free-kicks";
+    if(/^frees/.test(w)) return w.replace("frees","frees up");
+    return w;
+  });
+}
+function intro(text){return '<p class="tabintro">'+text+'</p>'}
+function deadlineText(){
+  if(!D.meta.deadline) return {text:"Deadline not published yet", when:""};
+  var d=new Date(D.meta.deadline), now=new Date(), ms=d-now;
+  var when=d.toLocaleString(undefined,{weekday:"long",day:"numeric",month:"short",
+    hour:"2-digit",minute:"2-digit"});
+  if(ms<=0) return {text:"Deadline has passed — this gameweek is under way", when:when};
+  var hrs=ms/3600000, days=Math.round(hrs/24);
+  var left=hrs<1?"in "+Math.round(ms/60000)+" minutes"
+    :hrs<24?"in "+Math.round(hrs)+" hours"
+    :"in "+days+" day"+(days===1?"":"s");
+  return {text:"Deadline "+left, when:when};
+}
+
+/* ---------------- Home ---------------- */
+function renderHome(){
+  var mm=M(), sq=squadOf(), dl=deadlineText();
+  var lead=D.standings[0], gap=lead?lead.total-mm.total:null;
+  var h=intro('Everything worth doing this week, in one place. Each card links to the '+
+    'tab with the full detail. You are looking at <b>'+esc(mm.team)+'</b> — use '+
+    '<b>Change</b> at the top to switch to someone else in the league.');
+
+  h+='<div class="hero"><div><h2>Planning Gameweek '+D.meta.planFrom+'</h2>'+
+     '<div class="when">'+esc(dl.text)+(dl.when?' · '+esc(dl.when):'')+'</div></div>'+
+     '<div class="standing">'+(gap===null?'':(gap===0
+        ? '<b>Top</b> of '+esc(D.league?D.league.name:"your league")
+        : '<b>'+mm.rank+getOrdinal(mm.rank)+'</b> of '+D.standings.length+
+          ' · '+gap+' point'+(gap===1?'':'s')+' behind '+esc(lead.team)))+'</div></div>';
+
+  h+='<div class="acts">';
+
+  // 1. the transfer
+  var t=(mm.transfers||[])[0];
+  if(t){
+    var o1=P(t.outId), i1=P(t.inId);
+    h+='<div class="act"><div class="kicker">Best transfer</div>'+
+      '<div class="faces">'+photoHTML(o1,false)+'<b>'+esc(o1.name)+'</b>'+
+      '<span class="arrow">→</span>'+photoHTML(i1,false)+'<b>'+esc(i1.name)+'</b></div>'+
+      '<h3>Swap '+esc(o1.name)+' for '+esc(i1.name)+'</h3>'+
+      '<div class="body">'+
+      (t.cost>0?'Costs '+m(t.cost)+'. ':t.cost<0?'Frees up '+m(-t.cost)+'. ':'Same price. ')+
+      esc(i1.name)+' — '+esc(plainWhy(t.why).join(" · ")||"rates higher over the coming games")+
+      '. Biggest single gain available over the next '+D.horizon+' matches.</div>'+
+      '<button class="go" data-go="tx">See all transfer ideas</button></div>';
+  } else {
+    h+='<div class="act calm"><div class="kicker">Transfers</div>'+
+      '<h3>No change needed</h3><div class="body">Nothing affordable improves this squad '+
+      'over the next '+D.horizon+' matches. Save the transfer.</div>'+
+      '<button class="go" data-go="tx">Look anyway</button></div>';
+  }
+
+  // 2. the captain
+  var c=(mm.captaincy||[])[0];
+  if(c){
+    var cp=P(c.id), f=c.nextFix||{};
+    h+='<div class="act"><div class="kicker">Captain</div>'+
+      '<div class="faces">'+photoHTML(cp,false)+'<b>'+esc(cp.name)+'</b></div>'+
+      '<h3>Give the armband to '+esc(cp.name)+'</h3>'+
+      '<div class="body">'+esc(cp.clubFull)+
+      (f.opp?' play '+esc(f.opp)+(f.ha==="H"?" at home":" away")+
+        ', which is '+(f.fdr<=2?"a kind fixture":f.fdr>=4?"a tough one":"about average"):'')+
+      '. '+(c.rivalsOwning>=Math.ceil(c.leagueSize*0.6)
+        ? 'Most of your league own him, so this mainly protects your position.'
+        : 'Only '+c.rivalsOwning+' of '+c.leagueSize+' rivals own him — a big score gains ground.')+
+      (c.isCap?' He is already your captain.':'')+'</div>'+
+      '<button class="go" data-go="cap">Compare captain options</button></div>';
+  }
+
+  // 3. anything to worry about
+  var flagged=sq.filter(function(p){return p.starting&&p.status!=="a"});
+  var benchFit=sq.filter(function(p){return !p.starting&&p.status==="a"});
+  if(flagged.length){
+    h+='<div class="act warn"><div class="kicker">Needs a look</div>'+
+      '<h3>'+flagged.length+' player'+(flagged.length===1?'':'s')+
+      ' in your line-up '+(flagged.length===1?'has':'have')+' a fitness flag</h3>'+
+      '<div class="body"><ul class="flaglist">'+flagged.map(function(p){
+        return '<li><b>'+esc(p.name)+'</b> — '+esc(p.news||"not fully fit")+'</li>'
+      }).join("")+'</ul>'+(benchFit.length?'<p style="margin:9px 0 0">You have '+
+        benchFit.length+' fit player'+(benchFit.length===1?'':'s')+
+        ' on the bench to swap in.</p>':'')+'</div>'+
+      '<button class="go" data-go="squad">Open my team</button></div>';
+  } else {
+    h+='<div class="act calm"><div class="kicker">Fitness</div>'+
+      '<h3>Everyone in your line-up is fit</h3>'+
+      '<div class="body">No injury or doubt flags in the starting eleven. Worth checking '+
+      'again after the Friday press conferences — this only knows what the game has published.'+
+      '</div><button class="go" data-go="squad">Open my team</button></div>';
+  }
+  h+='</div>';
+  $("#p-home").innerHTML=h;
+  wireImgs($("#p-home"));
+}
+function getOrdinal(n){
+  var s=["th","st","nd","rd"], v=n%100;
+  return s[(v-20)%10]||s[v]||s[0];
+}
+
 /* ---------------- Transfers ---------------- */
 function explainTransfer(t){
   var i=P(t.inId), o=P(t.outId);
@@ -1642,13 +1900,14 @@ function explainTransfer(t){
     return '<tr><td>'+lab+' '+esc(p.name)+'</td><td class="n">base '+p.base.toFixed(1)+
       ' × '+p.mult5.toFixed(2)+'/'+D.horizon+'</td><td class="r">'+p.proj5.toFixed(1)+'</td></tr>';
   }
-  var h='<h5>How the five-match impact was built</h5><table class="calc">'+
+  var h='<h5>How this was worked out</h5><table class="calc">'+
     line(i,"In —")+line(o,"Out —")+
-    '<tr class="tot"><td>Five-match impact</td><td class="n"></td><td class="r">'+
+    '<tr class="tot"><td>Gain over next 5</td><td class="n"></td><td class="r">'+
     (t.gain5>0?"+":"")+t.gain5.toFixed(1)+'</td></tr></table>'+
     '<p><b>Base</b> is the model score with the fixture term stripped out — what the player is, '+
     'independent of who he faces. <b>The multiplier</b> weights each of the next '+D.horizon+
-    ' matches by difficulty (FDR 1 counts 1.30, 3 counts 1.00, 5 counts 0.70), so a blank '+
+    ' matches by difficulty (the easiest counts 1.30, an average one 1.00, the hardest '+
+    '0.70), so a blank '+
     'gameweek adds nothing and a double counts twice. Divided by '+D.horizon+
     ', an ordinary run of five average fixtures leaves the base untouched.</p>'+
     '<p><b>This number is an index, not points.</b> It says which move is worth more than '+
@@ -1658,12 +1917,13 @@ function explainTransfer(t){
 }
 function renderTx(){
   var mm=M(), tx=mm.transfers||[];
-  var head='<div class="msg info"><b>Ranked by what each swap does over the next '+D.horizon+
-    ' matches</b>, not just raw quality. A player\u2019s rating is stripped of its fixture '+
-    'term, then re-weighted by the actual difficulty of his next '+D.horizon+
-    ' games — so an easy run lifts a move and a blank gameweek drags it down. Every swap '+
-    'shown is affordable on '+esc(mm.team)+'\u2019s bank and keeps the three-per-club limit. '+
-    'The impact figure is a relative index, not a points forecast.</div>';
+  var head=intro('Swaps worth making, best first. Each one is judged on the <b>next '+
+    D.horizon+' matches</b> — so a player with an easy run rises and one facing a hard '+
+    'stretch falls. Everything here fits '+esc(mm.team)+'\u2019s budget and keeps you '+
+    'inside the three-players-per-club rule. Tap <b>?</b> on any card to see the working.')+
+    '<div class="msg info">The gain number compares two players. It is a <b>score for '+
+    'ranking moves against each other</b>, not a prediction of points — so do not weigh it '+
+    'against the −4 you pay for an extra transfer.</div>';
   if(!tx.length){
     $("#p-tx").innerHTML=head+'<p class="emptynote">No swap improves this squad over the '+
       'next '+D.horizon+' matches within budget. That is a good sign.</p>';
@@ -1679,12 +1939,12 @@ function renderTx(){
     return '<div class="tcard"><div class="tmove">'+side(o,"out")+
       '<span class="tarrow">→</span>'+side(i,"in")+
       '<span class="tgain"><b>'+(t.gain5>0?"+":"")+t.gain5.toFixed(1)+'</b>'+
-      '<span>'+D.horizon+'-match impact</span></span></div>'+
-      '<div class="tmeta"><span class="pill">Model score '+(t.delta>0?"+":"")+
+      '<span>gain over next '+D.horizon+'</span></span></div>'+
+      '<div class="tmeta"><span class="pill">Rating '+(t.delta>0?"+":"")+
       t.delta.toFixed(1)+'</span><span class="pill'+(t.cost<=0?" good":"")+'">'+
       (t.cost>0?'Costs '+m(t.cost):t.cost<0?'Frees '+m(-t.cost):'Same price')+'</span>'+
       '<span class="pill">'+m(t.spare)+' left over</span>'+
-      (t.why&&t.why.length?'<span class="pill">'+esc(t.why.join(" · "))+'</span>':'')+
+      (t.why&&t.why.length?'<span class="pill">'+esc(plainWhy(t.why).join(" · "))+'</span>':'')+
       '</div><div class="tfix"><div><h6>Out — '+esc(o.name)+' · next '+D.horizon+
       '</h6>'+fixStrip(o.club,D.horizon)+'</div><div><h6>In — '+esc(i.name)+' · next '+
       D.horizon+'</h6>'+fixStrip(i.club,D.horizon)+'</div></div>'+
@@ -1711,7 +1971,11 @@ function renderLeague(){
     (D.managers[String(s.entry)].picks||[]).forEach(function(pk){
       ownCount[pk.id]=(ownCount[pk.id]||0)+1});
   });
-  var h='<div class="tblwrap"><table><thead><tr><th class="num">#</th><th>Team</th>'+
+  var h=intro('Where everyone stands. <b>Click a team name</b> to see their squad, or use '+
+    'the button inside to view the whole app as them. Below, the two lists show who '+
+    esc(mm.team)+' owns that nobody else does, and who the rest of the league owns that '+
+    'they do not.')+
+    '<div class="tblwrap"><table><thead><tr><th class="num">#</th><th>Team</th>'+
     '<th>Manager</th><th class="num">GW</th><th class="num">Total</th><th class="num">Gap</th>'+
     '<th class="num">Value</th><th class="num">Bank</th></tr></thead><tbody>'+
     D.standings.map(function(s){
@@ -1737,7 +2001,7 @@ function renderLeague(){
     (mm.uniques.length?mm.uniques.map(function(pid){
       var p=P(pid);
       return '<button class="alt" data-look="'+pid+'"><span class="d '+
-        (p.score>=70?"up":"dn")+'">'+Math.round(p.score)+'<small>score</small></span>'+
+        (p.score>=70?"up":"dn")+'">'+Math.round(p.score)+'<small>rating</small></span>'+
         '<span class="body"><span class="t">'+esc(p.name)+' <em>'+esc(p.club)+' · '+
         esc(p.pos)+' · '+m(p.price)+'</em></span><span class="w">'+p.pts+
         ' pts · '+p.owned+'% owned overall</span></span></button>'
@@ -1765,14 +2029,14 @@ function renderModel(){
   'transfer suggestion, or open any row on the Players tab, to see the arithmetic for that '+
   'specific player.</p>'+
   '<div class="wbar"><span class="wseg" style="flex:'+w.wPrior+';background:var(--accent)">'+
-  'Price prior '+Math.round(w.wPrior*100)+'%</span><span class="wseg" style="flex:'+w.wObs+
-  ';background:var(--good)">Observed form '+Math.round(w.wObs*100)+'%</span>'+
-  '<span class="wseg" style="flex:'+w.wFix+';background:var(--warn)">Fixtures '+
+  'Price signal '+Math.round(w.wPrior*100)+'%</span><span class="wseg" style="flex:'+w.wObs+
+  ';background:var(--good)">Recent form '+Math.round(w.wObs*100)+'%</span>'+
+  '<span class="wseg" style="flex:'+w.wFix+';background:var(--warn)">Fixture ease '+
   Math.round(w.wFix*100)+'%</span></div>'+
   '<p>That result is multiplied by availability and minutes security, then a set-piece bonus '+
   'is added: 6 for first-choice penalties, 2 for second, 2 each for first-choice corners or '+
   'direct free-kicks.</p>'+
-  '<h3>Observed form, by position</h3><ul>'+
+  '<h3>What counts as recent form</h3><ul>'+
   '<li><b>GK</b> — 65% team defensive solidity (xGC per 90), 35% ICT.</li>'+
   '<li><b>DEF</b> — 45% solidity, 30% defensive contribution, 25% attacking threat.</li>'+
   '<li><b>MID</b> — 55% xGI per 90, 25% defensive contribution, 20% ICT.</li>'+
@@ -1788,8 +2052,8 @@ function renderModel(){
   'toward observed rates around GW6-8.</p>'+
   '<h3>The Transfers tab</h3><p>That tab ranks swaps by a different number. A player\u2019s '+
   'rating has its fixture term stripped out, leaving base quality; that is then re-weighted '+
-  'by the difficulty of his next '+D.horizon+' matches (FDR 1 counts 1.30, 3 counts 1.00, '+
-  '5 counts 0.70), with blanks adding nothing and doubles counting twice. The gap between '+
+  'by the difficulty of his next '+D.horizon+' matches (the easiest fixture counts 1.30, '+
+  'an average one 1.00, the hardest 0.70), with blanks adding nothing and doubles counting twice. The gap between '+
   'the incoming and outgoing player is the impact. It is an index for comparing moves — '+
   '<b>not a points forecast</b>, so it should not be weighed against the −4 cost of an '+
   'extra transfer.</p>'+
@@ -1823,8 +2087,8 @@ function renderStrip(){
     '</span></div>'}).join("");
 }
 function renderAll(){
-  renderStrip(); renderSquad(); renderTx(); renderClubs(); renderPlayersShell();
-  renderCap(); renderLeague(); renderModel();
+  renderStrip(); renderHome(); renderSquad(); renderTx(); renderClubs();
+  renderPlayersShell(); renderCap(); renderLeague(); renderModel();
 }
 function bootUI(){
   $("#eyebrow").textContent=(D.meta.gwName||("Gameweek "+D.meta.gw))+
@@ -1849,6 +2113,8 @@ $("#changeteam").addEventListener("click",function(){
 });
 document.addEventListener("click",function(e){
   if(!e.target.closest) return;
+  var go=e.target.closest("[data-go]");
+  if(go){goTab(go.dataset.go); return}
   var pk=e.target.closest("[data-pick]");
   if(pk){showApp(Number(pk.dataset.pick)); window.scrollTo({top:0}); return}
   var qm=e.target.closest("[data-explain]");
@@ -1894,6 +2160,8 @@ document.addEventListener("click",function(e){
     window.scrollTo({top:0,behavior:"smooth"});
     return;
   }
+  var gwb=e.target.closest("[data-gw]");
+  if(gwb&&gwb.dataset.gw){gwView=Number(gwb.dataset.gw); renderClubs(); return}
   var cb=e.target.closest("[data-club]");
   if(cb){
     curClub=Number(cb.dataset.club); renderClubs();
