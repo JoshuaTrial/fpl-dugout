@@ -498,28 +498,82 @@ def match_expectation(strength, team_id, opp_id, home):
             "cs": round(math.exp(-xga), 3)}
 
 
-def difficulty_from(exp_):
-    """A 1-5 label so the interface keeps a familiar scale, but derived from the
-    expected goals above rather than a fixed pre-season number."""
-    # a fixture is hard when you are unlikely to score and likely to concede
-    score = exp_["xgf"] - exp_["xga"]
-    if score >= 0.75:
+# --- fixture difficulty, on one scale from end to end -----------------------
+# Difficulty is the market's view of the match, expressed as the gap between
+# winning and losing:
+#
+#     edge = P(win) - P(lose)
+#
+# An evenly priced match has an edge of zero and rates 3. The further the price
+# tilts, the further the rating moves from the middle. Where bookmakers have
+# priced a fixture the probabilities are theirs. Beyond their horizon -- they
+# rarely price more than a fortnight out -- the same arithmetic runs on
+# probabilities from the results-based ratings, so a 3 in six weeks' time means
+# what a 3 next Saturday means.
+#
+# Two earlier attempts are worth recording. Fixed thresholds in goals were wrong
+# because home advantage alone is worth 0.84 goals against bands 0.5 goals wide,
+# so the rating mostly reported the venue. Ranking fixtures into quintiles fixed
+# that but made the scale relative to whatever six weeks happened to be in view,
+# so an easy run could not look easy. On the edge scale venue is worth about
+# 0.37 against bands 0.25-0.30 wide: it moves a fixture one band, which is
+# roughly what playing at home is actually worth.
+EDGE_BANDS = (0.40, 0.15, -0.15, -0.40)
+
+
+def win_probs(exp_):
+    """Win, draw and lose probabilities implied by a pair of goal expectations."""
+    return _poisson_probs(max(0.05, exp_["xgf"]), max(0.05, exp_["xga"]))
+
+
+def difficulty_from_edge(edge):
+    """1 is the kindest fixture, 3 a coin toss, 5 the hardest."""
+    if edge >= EDGE_BANDS[0]:
         return 1
-    if score >= 0.25:
+    if edge >= EDGE_BANDS[1]:
         return 2
-    if score >= -0.25:
+    if edge >= EDGE_BANDS[2]:
         return 3
-    if score >= -0.75:
+    if edge >= EDGE_BANDS[3]:
         return 4
     return 5
 
 
+CONF_MATCHES = 6.0         # matches before the ratings are trusted in full
+
+
+def difficulty_from(exp_, probs=None, conf=1.0):
+    """Difficulty for one fixture. Pass market probabilities when they exist.
+
+    In August the ratings are built on one or two results, so they can be
+    confidently wrong -- a club that won its opener 3-0 rates as the best in the
+    league on that evidence. The edge is therefore pulled back toward even by how
+    much football has actually been played, so an early strip reads 3 across the
+    board rather than inventing distinctions. Home advantage re-emerges on its own
+    as the ratings earn their confidence.
+
+    The market needs none of this. A bookmaker's price already knows who is good
+    in week one, so a priced fixture passes through untouched.
+    """
+    if probs:
+        p_win, _p_draw, p_lose = probs
+    else:
+        p_win, _p_draw, p_lose = win_probs(exp_)
+    edge = (p_win - p_lose) * max(0.0, min(1.0, conf))
+    return difficulty_from_edge(edge), round(edge, 3)
+
+
 def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
-    """Each team's next FIX_GWS gameweeks, priced by the market where possible."""
+    """Each team's next FIX_GWS gameweeks, priced by the market where possible.
+
+    Every fixture is labelled on the same absolute edge scale, so no pass over
+    the whole set is needed and an easy run is allowed to look easy.
+    """
     priced = priced or {}
     gws = list(range(from_gw, from_gw + FIX_GWS))
     out = {}
     short = {t["id"]: t["short_name"] for t in teams}
+
     for t in teams:
         runs, diffs, css, atts = [], [], [], []
         for gw in gws:
@@ -533,18 +587,39 @@ def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
                 home = f["team_h"] == t["id"]
                 opp = f["team_a"] if home else f["team_h"]
                 mk = priced.get(f["id"])
+                # always compute the results-based view, so a market-priced
+                # fixture can show both numbers side by side and be audited
+                form_e = match_expectation(strength, t["id"], opp, home)
+                # trust the ratings in proportion to the football behind them
+                played = min((strength.get(t["id"]) or {}).get("played", 0),
+                             (strength.get(opp) or {}).get("played", 0))
+                conf = min(1.0, played / CONF_MATCHES)
+                form_d, form_edge = difficulty_from(form_e, None, conf)
                 if mk:
                     xgf = mk["xgh"] if home else mk["xga"]
                     xga = mk["xga"] if home else mk["xgh"]
                     e = {"xgf": xgf, "xga": xga, "cs": round(math.exp(-xga), 3)}
+                    # the market's own probabilities, not a Poisson round-trip
+                    probs = ((mk["pHome"], mk["pDraw"], mk["pAway"]) if home
+                             else (mk["pAway"], mk["pDraw"], mk["pHome"]))
                     src = "odds"
                 else:
-                    e = match_expectation(strength, t["id"], opp, home)
-                    src = "form"
-                d = difficulty_from(e)
+                    e, probs, src = form_e, None, "form"
+                if probs:                      # the market needs no shrinking
+                    d, edge = difficulty_from(e, probs)
+                else:
+                    d, edge = form_d, form_edge
+                # FPL's published rating, carried through for comparison only:
+                # nothing downstream reads it.
+                fpl_pub = f.get("team_h_difficulty" if home else "team_a_difficulty")
                 runs.append({"gw": int(gw), "opp": short.get(opp, "?"),
                              "ha": "H" if home else "A", "fdr": d,
-                             "cs": e["cs"], "xgf": e["xgf"], "src": src})
+                             "edge": edge, "fplFdr": fpl_pub,
+                             "cs": e["cs"], "xgf": e["xgf"], "src": src,
+                             "altXgf": (form_e["xgf"] if mk else None),
+                             "altCs": (form_e["cs"] if mk else None),
+                             "altEdge": (form_edge if mk else None),
+                             "altFdr": (form_d if mk else None)})
                 diffs.append(d); css.append(e["cs"]); atts.append(e["xgf"])
         out[t["id"]] = {
             "runs": runs,
@@ -871,8 +946,9 @@ def reasons(p):
         out.append("%d%% clean-sheet chance across the run" % round(p["csNext"] * 100))
     if p.get("form5") is not None and p["form5"] >= 5:
         out.append("%.1f points a game over the last five" % p["form5"])
-    if p["avgFdr"] is not None and p["avgFdr"] <= 2.85:
-        out.append("easy fixtures, difficulty %.2f" % p["avgFdr"])
+    # 3.00 is a run of coin tosses, so only call it kind once it is clearly below
+    if p["avgFdr"] is not None and p["avgFdr"] <= 2.60:
+        out.append("kind run of fixtures, difficulty %.2f" % p["avgFdr"])
     if p["owned"] <= 5 and p["score"] >= 70:
         out.append("owned by just %.1f%%" % p["owned"])
     if p["mins"] >= 90 and p["starts"] >= 1:
@@ -1403,6 +1479,15 @@ main{padding-top:24px}
 .fdr1,.fdr2{background:var(--good-bg);border-color:var(--good)} .fdr1 .n,.fdr2 .n{color:var(--good)}
 .fdr3{background:var(--sunk)} .fdr3 .n{color:var(--ink2)}
 .fdr4,.fdr5{background:var(--bad-bg);border-color:var(--bad)} .fdr4 .n,.fdr5 .n{color:var(--bad)}
+table.bands{border-collapse:collapse;margin:10px 0 14px;font-size:13px}
+table.bands th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9.5px;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
+  padding:0 18px 5px 0;border-bottom:1px solid var(--line)}
+table.bands td{padding:5px 18px 5px 0;border-bottom:1px solid var(--line);color:var(--ink2)}
+.fdrpill{display:inline-block;min-width:20px;text-align:center;padding:1px 5px;margin-right:6px;
+  border:1px solid var(--line);border-radius:5px;font-family:"IBM Plex Mono",monospace;
+  font-size:11px;font-weight:700;color:var(--ink)}
+.fdrpill.fdr1,.fdrpill.fdr2{color:var(--good)} .fdrpill.fdr4,.fdrpill.fdr5{color:var(--bad)}
 .alt{display:flex;gap:11px;align-items:flex-start;padding:10px 11px;border:1px solid var(--line);
   border-radius:8px;margin-bottom:7px;background:var(--card);width:100%;text-align:left;
   cursor:pointer;font:inherit;color:inherit}
@@ -1824,10 +1909,23 @@ function fixStrip(short,n){
     if(!r.opp) return '<div class="fx fdr3"><span class="g">GW'+r.gw+'</span>'+
       '<span class="o">—</span><span class="n">no game</span></div>';
     var mkt=r.src==="odds";
-    return '<div class="fx '+fdrCls(r.fdr)+(mkt?' mkt':'')+'" title="'+
-      (mkt?'Priced by the betting market':'From results so far')+
-      ' — expected goals '+(r.xgf==null?'?':r.xgf.toFixed(2))+
-      ', clean sheet '+(r.cs==null?'?':Math.round(r.cs*100)+'%')+'">'+
+    var eg=function(x){return x==null?'?':(x>0?'+':'')+x.toFixed(2)};
+    var tip = mkt
+      ? ('BETTING MARKET (in use): win chance minus lose chance '+eg(r.edge)+
+         ' → difficulty '+r.fdr+
+         '\nExpected goals '+(r.xgf==null?'?':r.xgf.toFixed(2))+
+         ', clean sheet '+(r.cs==null?'?':Math.round(r.cs*100)+'%')+
+         '\nResults model would say: edge '+eg(r.altEdge)+', difficulty '+
+         (r.altFdr==null?'?':r.altFdr)+' ('+(r.altXgf==null?'?':r.altXgf.toFixed(2))+
+         ' goals, '+(r.altCs==null?'?':Math.round(r.altCs*100)+'%')+' clean sheet)')
+      : ('RESULTS MODEL (in use): win chance minus lose chance '+eg(r.edge)+
+         ' → difficulty '+r.fdr+
+         '\nExpected goals '+(r.xgf==null?'?':r.xgf.toFixed(2))+
+         ', clean sheet '+(r.cs==null?'?':Math.round(r.cs*100)+'%')+
+         '\nNot priced by the market yet');
+    if(r.fplFdr!=null) tip += '\nFPL’s own pre-season rating: '+r.fplFdr+
+      (r.fplFdr===r.fdr?' (agrees)':' (differs)');
+    return '<div class="fx '+fdrCls(r.fdr)+(mkt?' mkt':'')+'" title="'+esc(tip)+'">'+
       '<span class="g">GW'+r.gw+' '+r.ha+'</span>'+
       '<span class="o">'+esc(r.opp)+'</span><span class="n">Diff '+r.fdr+'</span></div>'
   }).join("")+'</div>';
@@ -1855,8 +1953,8 @@ function pillsFor(p){
   else if(p.pen===2) o.push('<span class="pill">Penalties · 2nd</span>');
   if(p.ck===1) o.push('<span class="pill">Corners · 1st</span>');
   if(p.fk===1) o.push('<span class="pill">Free-kicks · 1st</span>');
-  if(p.avgFdr!=null) o.push('<span class="pill'+(p.avgFdr<=2.8?" good":p.avgFdr>=3.4?" bad":"")+
-    '" title="Average difficulty of the next six matches. 1 is the easiest fixture, 5 the hardest.">Next 6 · difficulty '+p.avgFdr.toFixed(2)+'</span>');
+  if(p.avgFdr!=null) o.push('<span class="pill'+(p.avgFdr<=2.6?" good":p.avgFdr>=3.4?" bad":"")+
+    '" title="Average difficulty of the next six matches. 3.00 means a run of coin tosses; below that is kind, above it is hard.">Next 6 · difficulty '+p.avgFdr.toFixed(2)+'</span>');
   if(p.owned<=5) o.push('<span class="pill">Differential · '+p.owned+'% owned</span>');
   if(p.costChange!==0) o.push('<span class="pill">Price '+(p.costChange>0?"+":"")+
     (p.costChange/10).toFixed(1)+'m since start</span>');
@@ -2126,7 +2224,7 @@ function renderClubs(){
     var owned=counts[String(c.id)]||0;
     return '<button class="clubbtn" data-club="'+c.id+'" aria-pressed="'+(curClub===c.id)+'">'+
       badgeHTML(c.code,c.short,false)+'<b>'+esc(c.short)+'</b><em>'+esc(c.name)+'</em>'+
-      '<em title="Average difficulty of this club\u2019s next six matches: 1 easiest, 5 hardest">Diff '+(c.avgFdr==null?"—":c.avgFdr.toFixed(2))+(owned?' · '+owned+' owned':'')+
+      '<em title="Average difficulty of this club\u2019s next six matches. 3.00 is a run of coin tosses; below that is kind, above it is hard.">Diff '+(c.avgFdr==null?"—":c.avgFdr.toFixed(2))+(owned?' · '+owned+' owned':'')+
       '</em></button>'
   }).join("")+'</div><div id="clubdetail"></div>';
   wireImgs($("#p-clubs"));
@@ -2599,8 +2697,43 @@ function renderModel(){
   '<p>From those, each upcoming match gets an expected goals for and against, and the chance '+
   'of a clean sheet is the Poisson probability of conceding zero. The fixture term is then '+
   '<b>position-aware</b>: clean-sheet chance for goalkeepers and defenders, expected goals '+
-  'scored for midfielders and forwards. The 1–5 difficulty you see on fixture strips is '+
-  'derived from that model, not from the published rating.</p>'+
+  'scored for midfielders and forwards.</p>'+
+  '<h3>The 1–5 on fixture strips</h3>'+
+  '<p>Difficulty is the betting market’s view of the match, boiled down to one number: '+
+  '<b>the chance of winning minus the chance of losing</b>. A match priced evenly has an '+
+  'edge of zero and rates 3. The further the price tilts, the further the rating moves '+
+  'from the middle.</p>'+
+  '<table class="bands"><tr><th>Win chance − lose chance</th><th>Rating</th></tr>'+
+  '<tr><td>+40 points or more</td><td><span class="fdrpill fdr1">1</span> kind</td></tr>'+
+  '<tr><td>+15 to +40</td><td><span class="fdrpill fdr2">2</span></td></tr>'+
+  '<tr><td>−15 to +15</td><td><span class="fdrpill fdr3">3</span> even</td></tr>'+
+  '<tr><td>−40 to −15</td><td><span class="fdrpill fdr4">4</span></td></tr>'+
+  '<tr><td>−40 or worse</td><td><span class="fdrpill fdr5">5</span> brutal</td></tr></table>'+
+  '<p><b>Early in the season it will say 3 to almost everything, and that is the point.</b> '+
+  'After one round a club that won 3–0 rates as the best in the league on the evidence '+
+  'available, which is nonsense. So the edge is pulled back toward even in proportion to how '+
+  'much football has been played, reaching full confidence at six matches. A strip of 3s in '+
+  'August means the ratings genuinely cannot separate these clubs yet — not that the fixtures '+
+  'are even. The betting market has no such problem and is not shrunk: it knew who was good '+
+  'in week one, so priced fixtures show their real number straight away.</p>'+
+  '<p>Bookmakers rarely price more than a fortnight ahead, so beyond their horizon the '+
+  'same arithmetic runs on win, draw and lose probabilities taken from the ratings above. '+
+  '<b>Same scale either way</b>, which is the point: a 3 in six weeks’ time means what '+
+  'a 3 next Saturday means. Hover any fixture to see which source produced it, the edge '+
+  'behind it, and — where the market has priced the game — what the results model would '+
+  'have said instead.</p>'+
+  '<p><b>Why not FPL’s own difficulty rating?</b> It is set before a ball is kicked and '+
+  'barely moves. This season it never issues a 1 at all, 45% of all fixtures are labelled '+
+  '3, and it frequently gives both sides of a match the same number, so the venue does not '+
+  'register. It is shown in the fixture tooltip purely as a cross-check; nothing in this '+
+  'app calculates with it.</p>'+
+  '<p><b>Two earlier versions were wrong</b>, and it is worth saying how. Fixed thresholds '+
+  'measured in goals failed because home advantage alone is worth 0.84 goals against bands '+
+  '0.5 goals wide — so the rating largely reported where the match was being played. '+
+  'Ranking every fixture into quintiles fixed that but made the scale relative to whichever '+
+  'six weeks were in view, so a genuinely easy run could never look easy. On the edge scale '+
+  'the venue is worth about 0.37 against bands 0.25–0.30 wide: it shifts a fixture one '+
+  'band, which is about what playing at home is really worth.</p>'+
 
   '<h3>Betting odds</h3>'+
   (function(){
@@ -2624,6 +2757,41 @@ function renderModel(){
       'transfers and team news within minutes, and published work finds them better '+
       'calibrated than statistical models — so adding a key would improve this most in '+
       'August, when there are barely any results to learn from.</p>';
+  })()+
+  (function(){
+    var o=D.odds||{};
+    if(!(o.status==="on"&&o.priced)) return "";
+    var rows=[];
+    Object.keys(D.fixtures).forEach(function(sh){
+      (D.fixtures[sh].runs||[]).forEach(function(r){
+        if(r.src==="odds"&&r.ha==="H") rows.push({home:sh,away:r.opp,gw:r.gw,
+          mk:r.xgf,fm:r.altXgf,mcs:r.cs,fcs:r.altCs,md:r.fdr,fd:r.altFdr});
+      });
+    });
+    rows.sort(function(a,b){return a.gw-b.gw});
+    if(!rows.length) return "";
+    return '<h4 class="seclab" style="margin-top:18px">Check it yourself<i></i></h4>'+
+      '<p>Every priced fixture below, with the number in use and what the results model '+
+      'would have said instead. If the two columns differ, the market is what the ratings '+
+      'are built on.</p>'+
+      '<div class="tblwrap" style="margin-bottom:14px"><table><thead><tr>'+
+      '<th class="num">GW</th><th>Fixture</th>'+
+      '<th class="num">Market goals</th><th class="num">Results goals</th>'+
+      '<th class="num">Market clean sheet</th><th class="num">Results clean sheet</th>'+
+      '<th class="num">Difficulty</th></tr></thead><tbody>'+
+      rows.map(function(r){
+        var same = r.fm!=null && Math.abs(r.mk-r.fm)<0.005;
+        return '<tr><td class="num">'+r.gw+'</td><td class="pname">'+esc(r.home)+
+          ' v '+esc(r.away)+'</td>'+
+          '<td class="num"><b>'+(r.mk==null?'—':r.mk.toFixed(2))+'</b></td>'+
+          '<td class="num dim">'+(r.fm==null?'—':r.fm.toFixed(2))+'</td>'+
+          '<td class="num"><b>'+(r.mcs==null?'—':Math.round(r.mcs*100)+'%')+'</b></td>'+
+          '<td class="num dim">'+(r.fcs==null?'—':Math.round(r.fcs*100)+'%')+'</td>'+
+          '<td class="num">'+r.md+(r.fd!=null&&r.fd!==r.md?' <span class="dim">(was '+
+            r.fd+')</span>':'')+'</td></tr>'
+      }).join("")+'</tbody></table></div>'+
+      '<p class="emptynote" style="padding-top:0">Figures are for the home side. '+
+      'Bold is in use.</p>';
   })()+
   '<p>Where the market is used, the three prices for a match are stripped of the '+
   'bookmaker\u2019s margin, then the pair of goal expectations that reproduces those '+
