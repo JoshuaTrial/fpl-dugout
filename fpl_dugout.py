@@ -19,6 +19,7 @@ Configure your own team below, or pass them on the command line:
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import ssl
@@ -178,39 +179,186 @@ def pct_ranks(values):
 # ----------------------------------------------------------------------------
 # the model  (documented in the UI's Model tab)
 # ----------------------------------------------------------------------------
-W_PRIOR, W_OBS, W_FIX = 0.55, 0.25, 0.20
 POS = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 DC_THRESH = {"GK": 999, "DEF": 10, "MID": 12, "FWD": 12}
 FIX_GWS = 6
 
 
-def build_fixture_map(fixtures, teams, from_gw):
+# ---------------------------------------------------------------------------
+# Team strength, from results rather than a pre-season opinion
+# ---------------------------------------------------------------------------
+# The FPL difficulty rating is set before a ball is kicked and never moves. These
+# ratings are rebuilt from goals actually scored and conceded, shrunk toward the
+# league average so that one freak result does not dominate in August.
+PRIOR_MATCHES = 6.0        # weight of the "league average" prior, in matches
+HOME_ADV = 1.15            # goals multiplier at home, /1.15 away
+
+
+def team_strength(fixtures, teams):
+    """Attack and defence multipliers per team, 1.0 = league average."""
+    rec = {t["id"]: {"gf": 0.0, "ga": 0.0, "p": 0} for t in teams}
+    done = [f for f in fixtures
+            if f.get("finished") and f.get("team_h_score") is not None
+            and f.get("team_a_score") is not None]
+    for f in done:
+        h, a = rec.get(f["team_h"]), rec.get(f["team_a"])
+        if not h or not a:
+            continue
+        hs, as_ = float(f["team_h_score"]), float(f["team_a_score"])
+        h["gf"] += hs; h["ga"] += as_; h["p"] += 1
+        a["gf"] += as_; a["ga"] += hs; a["p"] += 1
+    total_goals = sum(r["gf"] for r in rec.values())
+    total_games = sum(r["p"] for r in rec.values())
+    avg = (total_goals / total_games) if total_games else 1.4   # goals per team per match
+    out = {}
+    for tid, r in rec.items():
+        # shrink toward the average: with no games played both ratings are exactly 1.0
+        att = (r["gf"] + avg * PRIOR_MATCHES) / (r["p"] + PRIOR_MATCHES) / avg
+        dfn = (r["ga"] + avg * PRIOR_MATCHES) / (r["p"] + PRIOR_MATCHES) / avg
+        out[tid] = {"att": round(att, 3), "def": round(dfn, 3),
+                    "played": r["p"], "gf": r["gf"], "ga": r["ga"]}
+    out["_avg"] = avg
+    out["_played"] = (total_games // 2) if total_games else 0
+    return out
+
+
+def match_expectation(strength, team_id, opp_id, home):
+    """Expected goals for and against in one fixture, plus a clean-sheet chance.
+
+    Poisson: the probability of conceding zero is exp(-expected goals against).
+    """
+    avg = strength["_avg"]
+    t, o = strength.get(team_id), strength.get(opp_id)
+    if not t or not o:
+        return {"xgf": avg, "xga": avg, "cs": math.exp(-avg)}
+    ha = HOME_ADV if home else 1.0 / HOME_ADV
+    xgf = avg * t["att"] * o["def"] * ha
+    xga = avg * o["att"] * t["def"] / ha
+    return {"xgf": round(xgf, 3), "xga": round(xga, 3),
+            "cs": round(math.exp(-xga), 3)}
+
+
+def difficulty_from(exp_):
+    """A 1-5 label so the interface keeps a familiar scale, but derived from the
+    expected goals above rather than a fixed pre-season number."""
+    # a fixture is hard when you are unlikely to score and likely to concede
+    score = exp_["xgf"] - exp_["xga"]
+    if score >= 0.75:
+        return 1
+    if score >= 0.25:
+        return 2
+    if score >= -0.25:
+        return 3
+    if score >= -0.75:
+        return 4
+    return 5
+
+
+def build_fixture_map(fixtures, teams, from_gw, strength):
+    """Each team's next FIX_GWS gameweeks, with what the strength model expects."""
     gws = list(range(from_gw, from_gw + FIX_GWS))
     out = {}
     short = {t["id"]: t["short_name"] for t in teams}
     for t in teams:
-        runs, diffs = [], []
+        runs, diffs, css, atts = [], [], [], []
         for gw in gws:
             games = [f for f in fixtures if f.get("event") == gw
                      and (f["team_h"] == t["id"] or f["team_a"] == t["id"])]
             if not games:
-                runs.append({"gw": gw, "opp": None, "ha": "-", "fdr": None})
+                runs.append({"gw": gw, "opp": None, "ha": "-", "fdr": None,
+                             "cs": None, "xgf": None})
                 continue
             for f in games:
                 home = f["team_h"] == t["id"]
-                opp = short.get(f["team_a"] if home else f["team_h"], "?")
-                fdr = f.get("team_h_difficulty" if home else "team_a_difficulty") or 3
-                runs.append({"gw": gw, "opp": opp, "ha": "H" if home else "A",
-                             "fdr": int(fdr)})
-                diffs.append(int(fdr))
-        out[t["id"]] = {"runs": runs,
-                        "avgFdr": round(sum(diffs) / len(diffs), 2) if diffs else None}
+                opp = f["team_a"] if home else f["team_h"]
+                e = match_expectation(strength, t["id"], opp, home)
+                d = difficulty_from(e)
+                runs.append({"gw": int(gw), "opp": short.get(opp, "?"),
+                             "ha": "H" if home else "A", "fdr": d,
+                             "cs": e["cs"], "xgf": e["xgf"]})
+                diffs.append(d); css.append(e["cs"]); atts.append(e["xgf"])
+        out[t["id"]] = {
+            "runs": runs,
+            "avgFdr": round(sum(diffs) / len(diffs), 2) if diffs else None,
+            "csNext": round(sum(css) / len(css), 3) if css else None,
+            "xgfNext": round(sum(atts) / len(atts), 3) if atts else None,
+        }
     return out
 
 
-def score_players(boot, fixmap):
+# ---------------------------------------------------------------------------
+# Per-gameweek history -> multi-window form, hit rates, real minutes
+# ---------------------------------------------------------------------------
+FORM_WINDOW = 6            # how many recent gameweeks to pull
+
+
+def gw_history(current_gw, window=FORM_WINDOW):
+    """Per-player match logs from the live endpoint, newest gameweek last.
+
+    One request per gameweek rather than one per player, so six calls covers
+    the whole league.
+    """
+    hist, got = {}, []
+    start = max(1, current_gw - window + 1)
+    for gw in range(start, current_gw + 1):
+        try:
+            live = fetch("/event/%d/live/" % gw, ttl=600)
+        except FPLError:
+            continue
+        for el in live.get("elements", []):
+            st = el.get("stats") or {}
+            mins = num(st.get("minutes"))
+            hist.setdefault(el["id"], []).append({
+                "gw": gw,
+                "mins": mins,
+                "pts": num(st.get("total_points")),
+                "dc": num(st.get("defensive_contribution")),
+                "xgi": num(st.get("expected_goal_involvements")),
+                "started": mins >= 60,
+            })
+        got.append(gw)
+    return hist, got
+
+
+def window_stats(log, pos):
+    """Collapse a player's match log into the numbers the model actually uses."""
+    thr = DC_THRESH.get(pos, 12)
+    played = [g for g in log if g["mins"] > 0]
+
+    def ppm(rows):
+        return (sum(g["pts"] for g in rows) / len(rows)) if rows else None
+
+    last3, last5 = log[-3:], log[-5:]
+    # a hit rate only means something once a player has actually been on the pitch
+    hits = [g for g in played if g["dc"] >= thr]
+    return {
+        "form3": ppm(last3), "form5": ppm(last5), "formAll": ppm(log),
+        "dcHit": (len(hits) / len(played)) if played else None,
+        "dcPlayed": len(played),
+        "mins3": (sum(g["mins"] for g in last3) / len(last3)) if last3 else None,
+        "mins5": (sum(g["mins"] for g in last5) / len(last5)) if last5 else None,
+        "starts": sum(1 for g in log if g["started"]),
+        "apps": len(played),
+        "matches": len(log),
+    }
+
+
+def model_weights(matches_played):
+    """How much to trust price versus what has actually happened.
+
+    Price is the market's season-long estimate and is the steadiest thing
+    available in August, but it stops being the best guide once real matches
+    accumulate. The weight on it decays from 55% to 20% over the first seven
+    rounds; whatever it gives up goes to observed form.
+    """
+    w_prior = max(0.20, 0.55 - 0.05 * max(0, matches_played))
+    w_fix = 0.20
+    return round(w_prior, 3), round(1 - w_prior - w_fix, 3), w_fix
+
+
+def score_players(boot, fixmap, hist, matches_played):
     els = boot["elements"]
-    teams = {t["id"]: t for t in boot["teams"]}
+    W_PRIOR, W_OBS, W_FIX = model_weights(matches_played)
 
     for e in els:
         e["_pos"] = POS.get(e["element_type"], "MID")
@@ -225,10 +373,46 @@ def score_players(boot, fixmap):
         e["_xgi90"] = (e["_xgi"] / m90) if m90 else 0.0
         e["_ict90"] = (e["_ict"] / m90) if m90 else 0.0
         e["_xgc90"] = (e["_xgc"] / m90) if m90 else None
-        e["_dc90"] = num(e.get("defensive_contribution_per_90"))
         e["_owned"] = num(e.get("selected_by_percent"))
+        e["_dc90"] = num(e.get("defensive_contribution_per_90"))
+
         fm = fixmap.get(e["team"], {})
         e["_avgFdr"] = fm.get("avgFdr")
+        e["_csNext"] = fm.get("csNext")
+        e["_xgfNext"] = fm.get("xgfNext")
+
+        # ---- multi-window history ----
+        log = hist.get(e["id"], [])
+        w = window_stats(log, e["_pos"]) if log else {}
+        e["_w"] = w
+        e["_form3"] = w.get("form3")
+        e["_form5"] = w.get("form5")
+        e["_dcHit"] = w.get("dcHit")
+        e["_dcPlayed"] = w.get("dcPlayed", 0)
+
+        # recent scoring rate, leaning on the newer window but not ignoring the season
+        parts, wts = [], []
+        if w.get("form3") is not None:
+            parts.append(w["form3"]); wts.append(0.45)
+        if w.get("form5") is not None:
+            parts.append(w["form5"]); wts.append(0.30)
+        season_ppg = num(e.get("points_per_game"))
+        parts.append(season_ppg); wts.append(0.25 if parts else 1.0)
+        e["_formBlend"] = sum(p * q for p, q in zip(parts, wts)) / sum(wts)
+
+        # ---- minutes, modelled rather than guessed ----
+        exp_mins = None
+        if w.get("mins3") is not None and w.get("mins5") is not None:
+            exp_mins = 0.65 * w["mins3"] + 0.35 * w["mins5"]
+        elif w.get("mins3") is not None:
+            exp_mins = w["mins3"]
+        elif mins:
+            exp_mins = mins / max(1, w.get("matches") or 1)
+        e["_expMins"] = exp_mins
+        if exp_mins is None:
+            e["_minfac"] = 0.58                       # never seen him play
+        else:
+            e["_minfac"] = round(0.35 + 0.65 * min(1.0, exp_mins / 90.0), 3)
 
         st = e.get("status", "a")
         chance = e.get("chance_of_playing_next_round")
@@ -239,18 +423,6 @@ def score_players(boot, fixmap):
         else:
             av = {"d": 0.5, "i": 0.1, "s": 0.1, "u": 0.05}.get(st, 0.5)
         e["_avail"] = av
-
-        if mins >= 90:
-            mf = 1.0
-        elif mins >= 60:
-            mf = 0.92
-        elif mins >= 20:
-            mf = 0.78
-        elif mins > 0:
-            mf = 0.68
-        else:
-            mf = 0.58
-        e["_minfac"] = mf
 
         sp = 0.0
         if e.get("penalties_order") == 1:
@@ -263,40 +435,42 @@ def score_players(boot, fixmap):
             sp += 2
         e["_sp"] = sp
 
-    # percentiles are computed within position
+    # ---- percentiles within position ----
     for pos in ("GK", "DEF", "MID", "FWD"):
         grp = [e for e in els if e["_pos"] == pos]
         if not grp:
             continue
-        worst_xgc = max([e["_xgc90"] for e in grp if e["_xgc90"] is not None] or [0])
         prior = pct_ranks([num(e.get("now_cost")) for e in grp])
         xgi = pct_ranks([e["_xgi90"] for e in grp])
         ict = pct_ranks([e["_ict90"] for e in grp])
-        dc = pct_ranks([min(e["_dc90"] / DC_THRESH[pos], 1.5) for e in grp])
-        safe = pct_ranks([(e["_xgc90"] if e["_xgc90"] is not None else worst_xgc)
-                          for e in grp])
+        form = pct_ranks([e["_formBlend"] for e in grp])
+        dc = pct_ranks([(e["_dcHit"] if e["_dcHit"] is not None else 0.0) for e in grp])
+        # fixture term is position-aware: clean sheets matter at the back,
+        # goals at the front
+        if pos in ("GK", "DEF"):
+            fixraw = [(e["_csNext"] if e["_csNext"] is not None else 0.25) for e in grp]
+        else:
+            fixraw = [(e["_xgfNext"] if e["_xgfNext"] is not None else 1.4) for e in grp]
+        fixp = pct_ranks(fixraw)
+
         for i, e in enumerate(grp):
-            defsafe = 1 - safe[i]
             if pos == "GK":
-                obs = 0.35 * ict[i] + 0.65 * defsafe
+                obs = 0.55 * form[i] + 0.45 * ict[i]
             elif pos == "DEF":
-                obs = 0.25 * xgi[i] + 0.30 * dc[i] + 0.45 * defsafe
+                obs = 0.35 * form[i] + 0.35 * dc[i] + 0.30 * xgi[i]
             elif pos == "MID":
-                obs = 0.55 * xgi[i] + 0.25 * dc[i] + 0.20 * ict[i]
+                obs = 0.40 * xgi[i] + 0.30 * form[i] + 0.30 * dc[i]
             else:
-                obs = 0.70 * xgi[i] + 0.30 * ict[i]
-            fixp = 0.5 if e["_avgFdr"] is None else max(0.0, min(1.0, (5 - e["_avgFdr"]) / 4))
+                obs = 0.55 * xgi[i] + 0.45 * form[i]
             e["_prior"] = prior[i]
             e["_obs"] = obs
-            e["_fix"] = fixp
+            e["_fix"] = fixp[i]
             e["_score"] = round(
-                100 * (W_PRIOR * prior[i] + W_OBS * obs + W_FIX * fixp)
+                100 * (W_PRIOR * prior[i] + W_OBS * obs + W_FIX * fixp[i])
                 * e["_avail"] * e["_minfac"] + e["_sp"], 1)
     return els
 
 
-# Fixture ease multiplier per match. An average run of five FDR-3 games sums to 5.0,
-# so the normalised factor is 1.0 and a player's projection equals his base quality.
 EASE = {1: 1.30, 2: 1.15, 3: 1.00, 4: 0.85, 5: 0.70}
 HORIZON = 5
 
@@ -311,10 +485,10 @@ def run_window(team_id, fixmap, k=HORIZON):
     return sel, mult
 
 
-def base_score(e):
-    """Quality with the fixture term removed -- what the player is, not who he plays."""
-    wsum = W_PRIOR + W_OBS
-    return (100 * (W_PRIOR * e.get("_prior", 0) + W_OBS * e.get("_obs", 0)) / wsum) \
+def base_score(e, wp, wo):
+    """Quality with the fixture term removed -- what he is, not who he faces."""
+    wsum = wp + wo
+    return (100 * (wp * e.get("_prior", 0) + wo * e.get("_obs", 0)) / wsum) \
         * e.get("_avail", 1) * e.get("_minfac", 1) + e.get("_sp", 0)
 
 
@@ -386,6 +560,13 @@ def slim(e, teams):
         "epNext": num(e.get("ep_next")),
         "code": int(num(e.get("code"))),           # -> player mugshot URL
         "teamCode": int(num(t.get("code"))),       # -> club badge URL
+        "form3": (round(e["_form3"], 2) if e.get("_form3") is not None else None),
+        "form5": (round(e["_form5"], 2) if e.get("_form5") is not None else None),
+        "formBlend": round(e.get("_formBlend", 0), 2),
+        "dcHit": (round(e["_dcHit"], 3) if e.get("_dcHit") is not None else None),
+        "dcPlayed": e.get("_dcPlayed", 0),
+        "expMins": (round(e["_expMins"]) if e.get("_expMins") is not None else None),
+        "csNext": e.get("_csNext"), "xgfNext": e.get("_xgfNext"),
         "expl": {"prior": round(e.get("_prior", 0), 3),
                  "obs": round(e.get("_obs", 0), 3),
                  "fix": round(e.get("_fix", 0), 3),
@@ -394,7 +575,11 @@ def slim(e, teams):
                  "sp": e.get("_sp", 0.0),
                  "xgiR": round(e.get("_xgi90", 0), 2),
                  "ictR": round(e.get("_ict90", 0), 2),
-                 "xgcR": (round(e["_xgc90"], 2) if e.get("_xgc90") is not None else None)},
+                 "xgcR": (round(e["_xgc90"], 2) if e.get("_xgc90") is not None else None),
+                 "form": round(e.get("_formBlend", 0), 2),
+                 "dcHit": (round(e["_dcHit"], 3) if e.get("_dcHit") is not None else None),
+                 "cs": e.get("_csNext"), "xgf": e.get("_xgfNext"),
+                 "expMins": (round(e["_expMins"]) if e.get("_expMins") is not None else None)},
     }
 
 
@@ -407,14 +592,18 @@ def reasons(p):
     if p["xgi90"] >= 0.45:
         out.append("%.2f goals+assists expected per 90" % p["xgi90"])
     thr = DC_THRESH.get(p["pos"], 12)
-    if p["pos"] != "GK" and p["dc90"] >= thr:
+    if p["pos"] != "GK" and p.get("dcHit") is not None and p["dcHit"] >= 0.5 \
+            and p.get("dcPlayed", 0) >= 2:
+        out.append("clears the defensive threshold in %d%% of matches"
+                   % round(p["dcHit"] * 100))
+    elif p["pos"] != "GK" and p["dc90"] >= thr:
         out.append("%d defensive actions per 90, needs %d" % (int(p["dc90"]), thr))
+    if p["pos"] in ("GK", "DEF") and p.get("csNext") is not None and p["csNext"] >= 0.28:
+        out.append("%d%% clean-sheet chance across the run" % round(p["csNext"] * 100))
+    if p.get("form5") is not None and p["form5"] >= 5:
+        out.append("%.1f points a game over the last five" % p["form5"])
     if p["avgFdr"] is not None and p["avgFdr"] <= 2.85:
         out.append("easy fixtures, difficulty %.2f" % p["avgFdr"])
-    if p["pos"] in ("GK", "DEF") and p["mins"] and p["xgc"] and \
-            (p["xgc"] / (p["mins"] / 90.0)) <= 0.9:
-        out.append("%.2f goals conceded expected per 90"
-                   % (p["xgc"] / (p["mins"] / 90.0)))
     if p["owned"] <= 5 and p["score"] >= 70:
         out.append("owned by just %.1f%%" % p["owned"])
     if p["mins"] >= 90 and p["starts"] >= 1:
@@ -446,14 +635,27 @@ def build_payload(entry_id, league_id):
     plan_from = (nxt or cur or events[0])["id"]
 
     teams = {t["id"]: t for t in boot["teams"]}
-    fixmap = build_fixture_map(fixtures, boot["teams"], plan_from)
-    els = score_players(boot, fixmap)
+
+    # strength from results, not a pre-season opinion
+    strength = team_strength(fixtures, boot["teams"])
+    matches_played = max([v["played"] for k, v in strength.items()
+                          if not str(k).startswith("_")] or [0])
+    fixmap = build_fixture_map(fixtures, boot["teams"], plan_from, strength)
+
+    # per-gameweek logs for multi-window form, hit rates and real minutes
+    last_done = max([e["id"] for e in events if e.get("finished")] or [0])
+    hist, hist_gws = ({}, [])
+    if last_done:
+        hist, hist_gws = gw_history(last_done)
+
+    els = score_players(boot, fixmap, hist, matches_played)
+    w_prior, w_obs, w_fix = model_weights(matches_played)
     by_id = {e["id"]: e for e in els}
     players = [slim(e, teams) for e in els]
     pslim = {p["id"]: p for p in players}
     for e in els:
         sel, mult = run_window(e["team"], fixmap)
-        bs = base_score(e)
+        bs = base_score(e, w_prior, w_obs)
         pr = pslim[e["id"]]
         pr["base"] = round(bs, 1)
         pr["mult5"] = round(mult, 2)
@@ -648,7 +850,10 @@ def build_payload(entry_id, league_id):
             "deadline": (nxt or {}).get("deadline_time"),
             "fetched": time.strftime("%Y-%m-%d %H:%M:%S"),
             "live": not bool(MOCK_DIR),
-            "model": {"wPrior": W_PRIOR, "wObs": W_OBS, "wFix": W_FIX},
+            "model": {"wPrior": w_prior, "wObs": w_obs, "wFix": w_fix,
+                      "matchesPlayed": matches_played,
+                      "formGws": hist_gws, "formWindow": FORM_WINDOW,
+                      "priorMatches": PRIOR_MATCHES, "homeAdv": HOME_ADV},
         },
         "myEntry": entry_id,
         "league": league,
@@ -671,6 +876,8 @@ def build_payload(entry_id, league_id):
                                                      x.get("kickoff_time") or ""))
             if f.get("event")],
         "table": league_table(fixtures, boot["teams"]),
+        "strength": {str(k): v for k, v in strength.items() if not str(k).startswith("_")},
+        "leagueAvgGoals": round(strength["_avg"], 3),
         "horizon": HORIZON,
         "fixtures": {teams[k]["short_name"]: v for k, v in fixmap.items()},
     }
@@ -1333,11 +1540,16 @@ function fixStrip(short,n){
   }).join("")+'</div>';
 }
 function statGrid(p){
-  var rows=[["Pts",p.pts],["Mins",p.mins],["Starts",p.starts],["Form",p.form.toFixed(1)],
-    ["PPG",p.ppg.toFixed(1)],["Goals",p.goals],["Assists",p.assists],["Bonus",p.bonus],
+  var rows=[["Pts",p.pts],["Mins",p.mins],["Starts",p.starts],
+    ["Last 3",p.form3==null?"—":p.form3.toFixed(1)],
+    ["Last 5",p.form5==null?"—":p.form5.toFixed(1)],
+    ["Pts/game",p.ppg.toFixed(1)],
+    ["Exp. mins",p.expMins==null?"—":p.expMins],
+    ["Goals",p.goals],["Assists",p.assists],["Bonus",p.bonus],
     ["xG",p.xg.toFixed(2)],["xA",p.xa.toFixed(2)],["xGI/90",p.xgi90.toFixed(2)],
-    ["xGC",p.xgc.toFixed(2)],["ICT",p.ict],["BPS",p.bps],["Def. actions",p.dc],
-    ["Owned",p.owned+"%"]];
+    ["Def. hit rate",p.dcHit==null?"—":Math.round(p.dcHit*100)+"%"],
+    ["Clean sheet",p.csNext==null?"—":Math.round(p.csNext*100)+"%"],
+    ["ICT",p.ict],["BPS",p.bps],["Owned",p.owned+"%"]];
   return '<div class="stats">'+rows.map(function(r){
     return '<div class="st"><span class="k">'+esc(r[0])+'</span><span class="v">'+
       esc(r[1])+'</span></div>'}).join("")+'</div>';
@@ -1361,17 +1573,29 @@ function pillsFor(p){
 
 /* ---------------- the score, explained ---------------- */
 function obsSentence(p){
-  var x=p.expl;
-  if(p.pos==="GK") return "For keepers that is 65% how few chances the club concedes ("+
-    (x.xgcR==null?"no minutes yet":"xGC "+x.xgcR.toFixed(2)+" per 90")+") and 35% ICT.";
-  if(p.pos==="DEF") return "For defenders that is 45% clean-sheet likelihood ("+
-    (x.xgcR==null?"no minutes yet":"xGC "+x.xgcR.toFixed(2)+" per 90")+
-    "), 30% defensive contribution rate ("+p.dc90.toFixed(1)+" per 90 against a threshold of 10) "+
-    "and 25% attacking threat.";
-  if(p.pos==="MID") return "For midfielders that is 55% xGI per 90 ("+p.xgi90.toFixed(2)+
-    "), 25% defensive contribution ("+p.dc90.toFixed(1)+" per 90 against a threshold of 12) "+
-    "and 20% ICT.";
-  return "For forwards that is 70% xGI per 90 ("+p.xgi90.toFixed(2)+") and 30% ICT.";
+  var hit=p.dcHit==null?"not enough matches yet":Math.round(p.dcHit*100)+"% of matches";
+  var f=p.expl.form.toFixed(2);
+  if(p.pos==="GK") return "For keepers: 55% recent scoring rate ("+f+
+    " points a game, weighted toward the last three) and 45% ICT.";
+  if(p.pos==="DEF") return "For defenders: 35% recent scoring rate ("+f+
+    " a game), 35% how often he clears the defensive threshold ("+hit+
+    ") and 30% attacking threat ("+p.xgi90.toFixed(2)+" goals+assists expected per 90).";
+  if(p.pos==="MID") return "For midfielders: 40% goals+assists expected per 90 ("+
+    p.xgi90.toFixed(2)+"), 30% recent scoring rate ("+f+
+    " a game) and 30% how often he clears the defensive threshold ("+hit+").";
+  return "For forwards: 55% goals+assists expected per 90 ("+p.xgi90.toFixed(2)+
+    ") and 45% recent scoring rate ("+f+" a game).";
+}
+function fixSentence(p){
+  if(p.pos==="GK"||p.pos==="DEF")
+    return "Because clean sheets are what pays at the back, the fixture term is his chance "+
+      "of keeping one across the next six — "+
+      (p.csNext==null?"not yet computed":Math.round(p.csNext*100)+"%")+
+      " on average, from a Poisson model of both clubs\u2019 records so far.";
+  return "Because goals are what pays further forward, the fixture term is how many goals "+
+    "his side is expected to score across the next six — "+
+    (p.xgfNext==null?"not yet computed":p.xgfNext.toFixed(2)+" a game")+
+    ", from both clubs\u2019 records so far plus home advantage.";
 }
 function explainHTML(p){
   var w=D.meta.model, x=p.expl;
@@ -1390,17 +1614,20 @@ function explainHTML(p){
   h+=row("× minutes played","× "+x.minfac.toFixed(2),mn.toFixed(1));
   h+=row("+ set pieces","+ "+x.sp.toFixed(1),tot.toFixed(1));
   h+=row("Rating","",Math.round(tot),"tot");
+  var mp=(D.meta.model.matchesPlayed||0);
   h+='</table><p><b>Price signal '+x.prior.toFixed(2)+'</b> means he is priced above '+
-    Math.round(x.prior*100)+'% of '+esc(p.pos)+'s. With so little football played, price is '+
-    'the steadiest signal available, so it carries the most weight. '+
-    '<b>Recent form '+x.obs.toFixed(2)+'</b> is where he ranks on what actually matters for '+
-    'his position. '+esc(obsSentence(p))+' <b>Fixtures '+x.fix.toFixed(2)+'</b> comes from an '+
-    'average difficulty of '+(p.avgFdr==null?"—":p.avgFdr.toFixed(2))+
-    ' over the next six, where 1 is the easiest fixture and 5 the hardest.';
+    Math.round(x.prior*100)+'% of '+esc(p.pos)+'s. Price is the market\u2019s season-long '+
+    'estimate and the steadiest thing available early, so it starts at 55% of the score and '+
+    'falls to 20% by the seventh round. '+mp+' round'+(mp===1?' has':'s have')+' been played, so '+
+    'it currently carries '+Math.round(D.meta.model.wPrior*100)+'%. '+
+    '<b>Recent form '+x.obs.toFixed(2)+'</b> is where he ranks against others in his '+
+    'position. '+esc(obsSentence(p))+' <b>Fixtures '+x.fix.toFixed(2)+'</b>: '+
+    esc(fixSentence(p));
   if(x.avail<1) h+=' Availability is below 1.00 because he is flagged, which scales the whole '+
     'score down.';
-  if(x.minfac<1) h+=' Minutes security is '+x.minfac.toFixed(2)+' because he has played '+
-    p.mins+' minutes so far.';
+  if(x.minfac<1) h+=' Minutes security is '+x.minfac.toFixed(2)+
+    (p.expMins!=null?', from an expected '+p.expMins+' minutes based on his recent matches'
+                    :', because he has barely played')+'.';
   if(x.sp>0) h+=' The set-piece bonus of '+x.sp.toFixed(1)+' is added flat, after the multipliers.';
   h+='</p>';
   return h;
@@ -2023,52 +2250,88 @@ function renderLeague(){
 function renderModel(){
   var w=D.meta.model, mm=M(), b=mm.budget;
   var capped=Object.keys(mm.clubCounts).filter(function(k){return mm.clubCounts[k]>=3});
-  $("#p-model").innerHTML='<div class="prose">'+
-  '<h3>What the score means</h3><p>Every player gets a 0-100 score. It ranks fit against what '+
-  'predicts FPL returns — it is not a points projection. Click the <b>?</b> on any '+
-  'transfer suggestion, or open any row on the Players tab, to see the arithmetic for that '+
-  'specific player.</p>'+
+  var mp=w.matchesPlayed||0;
+  $("#p-model").innerHTML=intro('Every player carries a rating out of 100. This page says '+
+    'exactly how it is built and what it cannot see. Tap <b>?</b> on any transfer, or open a '+
+    'row on the Players tab, to get the same arithmetic for one specific player.')+
+  '<div class="prose">'+
+  '<h3>The three parts</h3>'+
   '<div class="wbar"><span class="wseg" style="flex:'+w.wPrior+';background:var(--accent)">'+
   'Price signal '+Math.round(w.wPrior*100)+'%</span><span class="wseg" style="flex:'+w.wObs+
   ';background:var(--good)">Recent form '+Math.round(w.wObs*100)+'%</span>'+
-  '<span class="wseg" style="flex:'+w.wFix+';background:var(--warn)">Fixture ease '+
+  '<span class="wseg" style="flex:'+w.wFix+';background:var(--warn)">Fixtures '+
   Math.round(w.wFix*100)+'%</span></div>'+
-  '<p>That result is multiplied by availability and minutes security, then a set-piece bonus '+
-  'is added: 6 for first-choice penalties, 2 for second, 2 each for first-choice corners or '+
-  'direct free-kicks.</p>'+
-  '<h3>What counts as recent form</h3><ul>'+
-  '<li><b>GK</b> — 65% team defensive solidity (xGC per 90), 35% ICT.</li>'+
-  '<li><b>DEF</b> — 45% solidity, 30% defensive contribution, 25% attacking threat.</li>'+
-  '<li><b>MID</b> — 55% xGI per 90, 25% defensive contribution, 20% ICT.</li>'+
-  '<li><b>FWD</b> — 70% xGI per 90, 30% ICT.</li></ul>'+
-  '<p>Defensive contribution uses the 2026/27 thresholds: 10 combined clearances, blocks, '+
-  'interceptions and tackles for a defender; 12 including recoveries for a midfielder or '+
-  'forward. Either is worth 2 points, once per match.</p>'+
-  '<h3>Why price carries the most weight early</h3>'+
-  '<p>Price encodes the market’s season-long expectation and is far steadier than a few '+
-  'matches of xG, so observed rates are shrunk toward it. Because alternatives are filtered to '+
-  'what the budget reaches, you are comparing similarly priced players and the prior largely '+
-  'cancels — the visible gap comes from form, fixtures and availability. Shift weight '+
-  'toward observed rates around GW6-8.</p>'+
-  '<h3>The Transfers tab</h3><p>That tab ranks swaps by a different number. A player\u2019s '+
-  'rating has its fixture term stripped out, leaving base quality; that is then re-weighted '+
-  'by the difficulty of his next '+D.horizon+' matches (the easiest fixture counts 1.30, '+
-  'an average one 1.00, the hardest 0.70), with blanks adding nothing and doubles counting twice. The gap between '+
-  'the incoming and outgoing player is the impact. It is an index for comparing moves — '+
-  '<b>not a points forecast</b>, so it should not be weighed against the −4 cost of an '+
-  'extra transfer.</p>'+
+  '<p><b>These weights move as the season goes on.</b> Price is the market’s season-long '+
+  'estimate of a player and it is the steadiest thing available in August, when nobody has '+
+  'played enough football to judge. So it starts at 55% and decays to 20% by the seventh '+
+  'round, handing what it gives up to observed form. '+mp+' round'+(mp===1?' has':'s have')+
+  ' been played, which is why it currently sits at '+Math.round(w.wPrior*100)+'%.</p>'+
+  '<p>The result is multiplied by availability and by expected minutes, then a set-piece '+
+  'bonus is added: 6 for first-choice penalties, 2 for second, 2 each for first-choice '+
+  'corners or direct free-kicks.</p>'+
+
+  '<h3>Recent form, by position</h3>'+
+  '<p>Scoring rate is measured over three windows — the last three matches, the last five, '+
+  'and the season — blended 45/30/25 so recent matches count for more without the season '+
+  'being ignored. It is then combined with what actually pays in each position:</p><ul>'+
+  '<li><b>Goalkeepers</b> — 55% scoring rate, 45% ICT.</li>'+
+  '<li><b>Defenders</b> — 35% scoring rate, 35% how often he clears the defensive-actions '+
+  'threshold, 30% attacking threat.</li>'+
+  '<li><b>Midfielders</b> — 40% goals and assists expected per 90, 30% scoring rate, '+
+  '30% defensive-actions hit rate.</li>'+
+  '<li><b>Forwards</b> — 55% goals and assists expected per 90, 45% scoring rate.</li></ul>'+
+  '<p>Note the words <b>hit rate</b>. What scores points is clearing the threshold in a match '+
+  '— 10 combined tackles, blocks, interceptions and clearances for a defender, 12 including '+
+  'recoveries further forward — so the model counts the share of matches a player actually '+
+  'clears it, not his average. A player who racks up 20 one week and 4 the next is worth less '+
+  'than one who quietly gets 11 every time.</p>'+
+
+  '<h3>Fixtures</h3>'+
+  '<p>This no longer uses the difficulty rating printed before the season. Attacking and '+
+  'defensive strength are rebuilt from goals actually scored and conceded, shrunk toward the '+
+  'league average with the weight of '+w.priorMatches+' matches so one freak result in August '+
+  'does not distort everything. Home advantage is a '+w.homeAdv+'× multiplier.</p>'+
+  '<p>From those, each upcoming match gets an expected goals for and against, and the chance '+
+  'of a clean sheet is the Poisson probability of conceding zero. The fixture term is then '+
+  '<b>position-aware</b>: clean-sheet chance for goalkeepers and defenders, expected goals '+
+  'scored for midfielders and forwards. The 1–5 difficulty you see on fixture strips is '+
+  'derived from that model, not from the published rating.</p>'+
+
+  '<h3>Minutes</h3>'+
+  '<p>Minutes are the most reliable thing in fantasy football: they happen every week, so '+
+  'they settle down long before goals do. Expected minutes come from the recent match log '+
+  '(65% the last three, 35% the last five) and scale the whole rating, so a genuine starter '+
+  'is never confused with someone getting twenty minutes off the bench.</p>'+
+
+  '<h3>Where this comes from</h3>'+
+  '<p>The structure follows the published work on forecasting this game. <b>OpenFPL</b> '+
+  '(arXiv 2508.09992, trained on 2020-21 to 2023-24 and tested on 2024-25) uses '+
+  'position-specific models fed by player, own-team and opponent features across several '+
+  'lookback windows — which is why this model separates the three windows and models team '+
+  'strength on both sides of a fixture. That expected goals beats raw goals as a predictor '+
+  'is established in the football-analytics literature. And the Premier League’s own data '+
+  'shows defensive-actions hit rates near 70% for the best specialists against roughly 40% '+
+  'for attacking midfielders, which is a far more repeatable signal than goalscoring.</p>'+
+  '<p><b>An honest ceiling.</b> OpenFPL is a trained ensemble on four seasons and still has '+
+  'a root-mean-square error of about 5 points on the players who actually haul. This is a '+
+  'hand-built heuristic, not a trained model, so treat it as a way of ranking options and '+
+  'surfacing things you might miss — not as a points forecast.</p>'+
+
   '<h3>Budget — '+esc(mm.team)+'</h3><p>Spending power is <b>'+m(b.total)+'</b> — '+
   m(b.squadValue)+' of squad plus '+m(b.bank)+' banked. A swap is offered only if the incoming '+
   'price fits the outgoing player’s selling price plus the bank, and the three-per-club '+
   'limit still holds.'+(capped.length?' At the cap for <b>'+esc(capped.join(", "))+'</b>.':'')+
-  '</p><p>Selling price is reconstructed as purchase price plus half of any rise, which assumes '+
-  'the player was bought at the season-start price. Someone bought after a rise will really '+
-  'sell for less than shown, so treat any move hinging on the last 0.2m as unconfirmed.</p>'+
+  '</p><p>Selling price is reconstructed as purchase price plus half of any rise, which '+
+  'assumes the player was bought at the season-start price. Someone bought after a rise will '+
+  'really sell for less, so treat any move hinging on the last 0.2m as unconfirmed.</p>'+
+
   '<h3>What it cannot know</h3><ul>'+
-  '<li>Press-conference team news — always check before the deadline.</li>'+
+  '<li><b>Team news.</b> The single biggest lever, and it is outside the model — always check '+
+  'the Friday press conferences before the deadline.</li>'+
   '<li>Rotation for cup and European fixtures.</li>'+
-  '<li>Whether a player is genuinely nailed on.</li>'+
-  '<li>Chip plans beyond what the API reports.</li></ul></div>';
+  '<li>Whether a player is genuinely nailed on, as opposed to currently in the side.</li>'+
+  '<li>Chip plans beyond what the game reports.</li>'+
+  '<li>Anything tactical: a new manager, a formation change, a role change.</li></ul></div>';
 }
 
 /* ---------------- top strip + orchestration ---------------- */
