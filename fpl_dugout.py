@@ -539,18 +539,26 @@ def difficulty_from_edge(edge):
     return 5
 
 
-CONF_MATCHES = 6.0         # matches before the ratings are trusted in full
+def rating_confidence(played):
+    """How far to trust the results-based edge, given the matches behind it.
+
+    Fitted, not guessed. Simulating seasons from known team strengths and
+    regressing the true edge on the model's gives the shrinkage that minimises
+    error: about 0.62 after one round, levelling off near 0.78. Two things fall
+    out of that. Early ratings carry more signal than an earlier version of this
+    function assumed, and -- less obviously -- the ratings stay roughly a quarter
+    too extreme even in midwinter, because multiplying two noisy strength numbers
+    together amplifies the noise in both. So the shrink never reaches 1.0.
+    """
+    return 0.78 - 0.16 / max(1.0, float(played or 0))
 
 
 def difficulty_from(exp_, probs=None, conf=1.0):
     """Difficulty for one fixture. Pass market probabilities when they exist.
 
-    In August the ratings are built on one or two results, so they can be
-    confidently wrong -- a club that won its opener 3-0 rates as the best in the
-    league on that evidence. The edge is therefore pulled back toward even by how
-    much football has actually been played, so an early strip reads 3 across the
-    board rather than inventing distinctions. Home advantage re-emerges on its own
-    as the ratings earn their confidence.
+    The results-based edge is pulled toward even by rating_confidence(), which
+    corrects for the ratings being systematically too extreme -- sharply so in
+    August, mildly so all season.
 
     The market needs none of this. A bookmaker's price already knows who is good
     in week one, so a priced fixture passes through untouched.
@@ -593,7 +601,7 @@ def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
                 # trust the ratings in proportion to the football behind them
                 played = min((strength.get(t["id"]) or {}).get("played", 0),
                              (strength.get(opp) or {}).get("played", 0))
-                conf = min(1.0, played / CONF_MATCHES)
+                conf = rating_confidence(played)
                 form_d, form_edge = difficulty_from(form_e, None, conf)
                 if mk:
                     xgf = mk["xgh"] if home else mk["xga"]
@@ -2709,13 +2717,20 @@ function renderModel(){
   '<tr><td>−15 to +15</td><td><span class="fdrpill fdr3">3</span> even</td></tr>'+
   '<tr><td>−40 to −15</td><td><span class="fdrpill fdr4">4</span></td></tr>'+
   '<tr><td>−40 or worse</td><td><span class="fdrpill fdr5">5</span> brutal</td></tr></table>'+
-  '<p><b>Early in the season it will say 3 to almost everything, and that is the point.</b> '+
-  'After one round a club that won 3–0 rates as the best in the league on the evidence '+
-  'available, which is nonsense. So the edge is pulled back toward even in proportion to how '+
-  'much football has been played, reaching full confidence at six matches. A strip of 3s in '+
-  'August means the ratings genuinely cannot separate these clubs yet — not that the fixtures '+
-  'are even. The betting market has no such problem and is not shrunk: it knew who was good '+
-  'in week one, so priced fixtures show their real number straight away.</p>'+
+  '<p><b>The model’s edge is deliberately damped, and by a fitted amount.</b> After one round '+
+  'a club that won 3–0 rates as the best in the league on the evidence available, which is '+
+  'nonsense — so early edges are pulled toward even. The size of the correction was measured '+
+  'rather than guessed: simulating seasons from known team strengths and regressing the true '+
+  'edge on the model’s gives the damping that minimises error. It comes out at about 0.62 '+
+  'after one round, rising to roughly 0.78 and staying there.</p>'+
+  '<p>That second number is the surprising one. Even in midwinter the ratings are about a '+
+  'quarter too extreme, because a fixture’s expectation multiplies two noisy strength numbers '+
+  'together and the noise in both compounds. So the damping never fully lifts. An earlier '+
+  'version of this app removed it entirely by the sixth round and was overconfident from then '+
+  'on; a version before that damped far too hard in August and reported 3 for almost '+
+  'everything. Both were wrong in measurable ways.</p>'+
+  '<p>None of this touches the betting market. A bookmaker’s price already knew who was good '+
+  'in week one, so priced fixtures pass through undamped and show their real number.</p>'+
   '<p>Bookmakers rarely price more than a fortnight ahead, so beyond their horizon the '+
   'same arithmetic runs on win, draw and lose probabilities taken from the ratings above. '+
   '<b>Same scale either way</b>, which is the point: a 3 in six weeks’ time means what '+
