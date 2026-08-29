@@ -1,0 +1,20 @@
+# Render blueprint. Commit this next to fpl_dugout.py and Render will
+# configure the service for you when you create it from this repo.
+services:
+  - type: web
+    name: fpl-dugout
+    runtime: python
+    plan: free
+    region: singapore          # closest Render region to India; also: oregon, frankfurt
+    buildCommand: "python -m compileall fpl_dugout.py"
+    startCommand: "python fpl_dugout.py"
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FPL_ENTRY
+        value: "8148026"       # your FPL team id
+      - key: FPL_LEAGUE
+        value: "1769954"       # Box2Box Players
+      - key: FPL_PASSWORD
+        sync: false            # set this yourself in the Render dashboard

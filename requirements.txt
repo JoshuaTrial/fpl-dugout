@@ -1,0 +1,2 @@
+# No third-party packages: the app is Python standard library only.
+# This file exists so Render detects a Python service.
