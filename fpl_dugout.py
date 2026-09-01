@@ -635,7 +635,9 @@ def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
     the whole set is needed and an easy run is allowed to look easy.
     """
     priced = priced or {}
-    gws = list(range(from_gw, from_gw + FIX_GWS))
+    # the season ends; do not invent gameweek 41
+    last_gw = max([f.get("event") or 0 for f in fixtures] or [from_gw + FIX_GWS])
+    gws = [g for g in range(from_gw, from_gw + FIX_GWS) if g <= last_gw]
     out = {}
     short = {t["id"]: t["short_name"] for t in teams}
 
@@ -1205,7 +1207,8 @@ PRIOR_TABLE = """\
 #      version of this model weighted the hit rate at 30-35% of a player's
 #      quality, which was actively harmful. Here it is what it really is, a
 #      2-point line item.
-GOAL_PTS = {"GK": 6, "DEF": 6, "MID": 5, "FWD": 4}
+# A goalkeeper scoring is worth 10, not 6 -- a detail this model had wrong.
+GOAL_PTS = {"GK": 10, "DEF": 6, "MID": 5, "FWD": 4}
 CS_PTS = {"GK": 4, "DEF": 4, "MID": 1, "FWD": 0}
 ASSIST_PTS = 3
 DC_PTS = 2
@@ -1951,6 +1954,585 @@ def chips_used(history):
             for k, v in sorted(out.items())]
 
 
+# ---------------------------------------------------------------------------
+# Ask a question about your own team
+# ---------------------------------------------------------------------------
+# A chat grounded in this app's own numbers rather than in general football
+# opinion. It is given the squad, the budget, the computed bundles and the
+# fixture picture, plus the rules of the game -- and, crucially, a tool that
+# runs the same transfer arithmetic the Transfers tab runs. That last part is
+# what keeps it honest: asked to price a combination nobody has scored yet, it
+# computes the answer instead of estimating one.
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "").strip()
+# overridable so the whole path can be exercised against a stub in testing
+ANTHROPIC_HOST = os.environ.get("ANTHROPIC_HOST", "https://api.anthropic.com").rstrip("/")
+CHAT_MAX_MONTH = int(os.environ.get("CHAT_MAX_MONTH", "500"))
+CHAT_MAX_TOKENS = int(os.environ.get("CHAT_MAX_TOKENS", "1200"))
+CHAT_STATE_FILE = os.environ.get("CHAT_STATE_FILE", "/tmp/fpl_dugout_chat.json")
+
+# Per million tokens. Published prices; override if they move.
+CHAT_PRICES = {"opus": (5.0, 25.0), "sonnet": (2.0, 10.0), "haiku": (1.0, 5.0)}
+
+_chat = {"month": "", "questions": 0, "in": 0, "out": 0,
+         "cacheRead": 0, "cacheWrite": 0, "model": None, "lastError": None}
+_payload_cache = {"t": 0.0, "data": None}
+
+
+def _chat_load():
+    try:
+        with open(CHAT_STATE_FILE) as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            _chat.update({k: saved.get(k, _chat[k]) for k in _chat})
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _chat_save():
+    """Best effort. Render's disk does not survive a redeploy, so the counter can
+    reset -- which is stated in the interface rather than hidden."""
+    try:
+        with open(CHAT_STATE_FILE, "w") as fh:
+            json.dump(_chat, fh)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _chat_month():
+    mon = time.strftime("%Y-%m")
+    if _chat["month"] != mon:
+        _chat.update(month=mon, questions=0, **{"in": 0, "out": 0},
+                     cacheRead=0, cacheWrite=0)
+        _chat_save()
+    return mon
+
+
+def chat_price(model):
+    m = (model or "").lower()
+    for fam, pr in CHAT_PRICES.items():
+        if fam in m:
+            return pr
+    return CHAT_PRICES["sonnet"]
+
+
+def chat_spend():
+    _chat_month()
+    pin, pout = chat_price(_chat["model"])
+    cost = (_chat["in"] / 1e6) * pin + (_chat["out"] / 1e6) * pout
+    cost += (_chat["cacheRead"] / 1e6) * pin * 0.1
+    cost += (_chat["cacheWrite"] / 1e6) * pin * 1.25
+    return {
+        "on": bool(ANTHROPIC_KEY), "model": _chat["model"] or ANTHROPIC_MODEL or None,
+        "month": _chat["month"], "questions": _chat["questions"],
+        "cap": CHAT_MAX_MONTH, "left": max(0, CHAT_MAX_MONTH - _chat["questions"]),
+        "inTokens": _chat["in"], "outTokens": _chat["out"],
+        "cacheRead": _chat["cacheRead"], "cacheWrite": _chat["cacheWrite"],
+        "cost": round(cost, 4),
+        "perQuestion": round(cost / _chat["questions"], 4) if _chat["questions"] else None,
+        "priceIn": pin, "priceOut": pout,
+        "stateFile": CHAT_STATE_FILE, "lastError": _chat["lastError"],
+    }
+
+
+def _anthropic(path, body=None, method="POST"):
+    url = ANTHROPIC_HOST + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+        "content-type": "application/json", "accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=90, context=ssl_context()) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def chat_model():
+    """Which model to call.
+
+    Model names change. Rather than freeze one into the source and have the app
+    break the day it retires, ask the API what exists and take the newest Sonnet.
+    An explicit ANTHROPIC_MODEL always wins.
+    """
+    if ANTHROPIC_MODEL:
+        return ANTHROPIC_MODEL
+    if _chat["model"]:
+        return _chat["model"]
+    try:
+        got = _anthropic("/v1/models?limit=100", None, "GET")
+        ids = [m["id"] for m in got.get("data", []) if m.get("id")]
+        pref = [i for i in ids if "sonnet" in i.lower()] or \
+               [i for i in ids if "haiku" in i.lower()] or ids
+        # ids sort chronologically because they carry a date suffix
+        _chat["model"] = sorted(pref)[-1]
+        _chat_save()
+        return _chat["model"]
+    except Exception as e:                                   # noqa: BLE001
+        _chat["lastError"] = "could not list models (%s)" % e
+        return "claude-sonnet-4-5"
+
+
+FPL_RULES = """RULES OF THE GAME (2026-27), which you may state as fact:
+
+SQUAD. 15 players costing at most 100.0m at purchase: 2 goalkeepers, 5 defenders,
+5 midfielders, 3 forwards. No more than 3 players from any one Premier League club.
+
+TEAM SELECTION. Eleven start. Always exactly 1 goalkeeper; at least 3 defenders,
+at least 2 midfielders, at least 1 forward. The other four sit on the bench in a
+set order. The captain scores double; if he plays no minutes the vice-captain
+takes it; if neither plays, nobody doubles. If a starter plays no minutes an
+automatic substitution brings on the first bench player who keeps the formation
+legal. The bench goalkeeper only ever replaces the goalkeeper.
+
+TRANSFERS. One free transfer a gameweek. Unused ones accumulate up to a maximum
+of 5. Each transfer beyond what you have costs 4 points, deducted from that
+gameweek. Maximum 20 transfers in a gameweek outside a chip.
+
+PRICES. Prices move at midnight UK time on ownership. When you sell, you keep
+half of any rise the player has made since you bought him, rounded down to 0.1m.
+Falls are not cushioned.
+
+CHIPS. Two sets. Wildcard, Free Hit, Bench Boost and Triple Captain are each
+available once in the first half and once in the second. The first set expires
+at the Gameweek 19 deadline and does not carry over. One chip per gameweek.
+Free Hit cannot be played in Gameweek 1. Wildcard makes transfers free and
+permanent; Free Hit does the same for one week and then reverts the squad.
+
+SCORING. Playing 1-59 minutes 1, 60+ minutes 2. Goal: goalkeeper 10, defender 6,
+midfielder 5, forward 4. Assist 3. Clean sheet: goalkeeper or defender 4,
+midfielder 1. Every 3 saves 1. Penalty saved 5. Penalty missed -2. Every 2 goals
+conceded by a goalkeeper or defender -1. Yellow card -1, red card -3, own goal
+-2. Bonus 1 to 3 for the best performers in a match. Defensive contribution: 2
+points for a defender reaching 10 clearances, blocks, interceptions and tackles,
+or a midfielder or forward reaching 12 including recoveries.
+
+DEADLINE. 90 minutes before the first match of the gameweek."""
+
+
+CHAT_TOOLS = [
+    {
+        "name": "score_transfers",
+        "description": (
+            "Price a specific transfer combination for the manager being viewed. "
+            "Give the players leaving and the players arriving BY NAME. Returns "
+            "whether the move is legal (positions, budget, three-per-club), the "
+            "change in expected points for the eleven that would actually play, "
+            "the points hit, and the net. Use this for ANY question of the form "
+            "'what if I did X' -- never estimate the answer yourself."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "out": {"type": "array", "items": {"type": "string"},
+                        "description": "Surnames of players to sell."},
+                "in": {"type": "array", "items": {"type": "string"},
+                       "description": "Surnames of players to buy."},
+                "free_transfers": {"type": "integer",
+                                   "description": "Free transfers held. Defaults to 1."},
+            },
+            "required": ["out", "in"],
+        },
+    },
+    {
+        "name": "find_players",
+        "description": (
+            "Look up players by name fragment, or list the best available in a "
+            "position within a price ceiling. Returns expected points for the next "
+            "match and the next five, price, ownership and the fixture run."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name fragment to search for."},
+                "position": {"type": "string", "enum": ["GK", "DEF", "MID", "FWD"]},
+                "max_price": {"type": "number", "description": "Ceiling in millions."},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+]
+
+
+# ---- the tools, run against the payload the interface is showing ----------
+def _pindex(payload):
+    return {p["id"]: p for p in payload["players"]}
+
+
+def _match_players(payload, needles, pool=None):
+    """Names to players. Surnames are how people actually refer to footballers."""
+    ps = pool if pool is not None else payload["players"]
+    out, missed = [], []
+    for n in needles:
+        key = (n or "").strip().lower()
+        if not key:
+            continue
+        hits = [p for p in ps if key == p["name"].lower()]
+        if not hits:
+            hits = [p for p in ps if key in p["name"].lower()]
+        if not hits:
+            hits = [p for p in ps if key in (p.get("full") or p["name"]).lower()]
+        if not hits:
+            missed.append(n)
+            continue
+        hits.sort(key=lambda p: -(p.get("proj5") or 0))
+        out.append(hits[0])
+    return out, missed
+
+
+def tool_find_players(payload, args):
+    P = payload["players"]
+    pool = P
+    if args.get("position"):
+        pool = [p for p in pool if p["pos"] == args["position"]]
+    if args.get("max_price") is not None:
+        pool = [p for p in pool if p["price"] <= float(args["max_price"]) + 1e-9]
+    if args.get("name"):
+        pool, _ = _match_players(payload, [args["name"]], pool)
+        if not pool:
+            return {"error": "no player matched %r" % args["name"]}
+    pool = sorted(pool, key=lambda p: -(p.get("proj5") or 0))[:int(args.get("limit") or 8)]
+    fx = payload.get("fixtures", {})
+    rows = []
+    for p in pool:
+        runs = (fx.get(p["club"]) or {}).get("runs") or []
+        rows.append({
+            "name": p["name"], "club": p["club"], "pos": p["pos"], "price": p["price"],
+            "xPtsNext": p.get("xp1"), "xPtsNext5": p.get("proj5"),
+            "pointsPerMillion": p.get("ppm"), "aboveReplacement": p.get("var"),
+            "owned": p.get("owned"), "status": p.get("status"),
+            "expectedMinutes": p.get("expMins"),
+            "fixtures": ["GW%s %s%s d%s" % (r["gw"], r.get("opp"), r.get("ha"), r.get("fdr"))
+                         for r in runs if r.get("opp")][:5],
+        })
+    return {"players": rows}
+
+
+def tool_score_transfers(payload, entry, args):
+    mm = (payload.get("managers") or {}).get(str(entry))
+    if not mm:
+        return {"error": "no squad loaded for this manager"}
+    idx = _pindex(payload)
+    squad = [dict(idx[pk["id"]], sell=pk["sell"]) for pk in mm["picks"] if pk["id"] in idx]
+    outs, miss_o = _match_players(payload, args.get("out") or [], squad)
+    owned = set(p["id"] for p in squad)
+    pool = [p for p in payload["players"] if p["id"] not in owned]
+    ins, miss_i = _match_players(payload, args.get("in") or [], pool)
+    if miss_o:
+        return {"error": "not in this squad: %s" % ", ".join(miss_o)}
+    if miss_i:
+        return {"error": "could not find, or already owned: %s" % ", ".join(miss_i)}
+    if len(outs) != len(ins):
+        return {"error": "%d out but %d in; a transfer is one for one"
+                         % (len(outs), len(ins))}
+    if not outs:
+        return {"error": "no transfers given"}
+
+    problems = []
+    from collections import Counter
+    if Counter(p["pos"] for p in outs) != Counter(p["pos"] for p in ins):
+        problems.append("positions do not match: out %s, in %s"
+                        % ("/".join(p["pos"] for p in outs), "/".join(p["pos"] for p in ins)))
+    bank = mm["budget"]["bank"]
+    funds = sum(p["sell"] for p in outs) + bank
+    cost = sum(p["price"] for p in ins)
+    if cost > funds + 1e-9:
+        problems.append("costs %.1fm but only %.1fm available (%.1fm of sales plus %.1fm bank)"
+                        % (cost, funds, funds - bank, bank))
+    clubs = Counter(p["club"] for p in squad)
+    for p in outs:
+        clubs[p["club"]] -= 1
+    for p in ins:
+        clubs[p["club"]] += 1
+    over = [c for c, n in clubs.items() if n > 3]
+    if over:
+        problems.append("would leave more than three from %s" % ", ".join(sorted(over)))
+
+    out_ids = set(p["id"] for p in outs)
+    new15 = [p for p in squad if p["id"] not in out_ids] + ins
+
+    def xi(sq, key):
+        got = pick_eleven([{"id": p["id"], "pos": p["pos"], "xp1": p.get(key) or 0.0}
+                           for p in sq])
+        return got if got else None
+
+    b5, a5 = xi(squad, "proj5"), xi(new15, "proj5")
+    b1, a1 = xi(squad, "xp1"), xi(new15, "xp1")
+    free = int(args.get("free_transfers") or mm.get("freeTransfers") or 1)
+    hits = max(0, len(outs) - free) * HIT_COST
+    gain5 = (a5["xiPoints"] - b5["xiPoints"]) if (a5 and b5) else 0.0
+    gain1 = (a1["xiPoints"] - b1["xiPoints"]) if (a1 and b1) else 0.0
+    if problems:
+        # Reporting an attractive gain for an impossible move invites it to be
+        # quoted back at the user. Say why it cannot be done, and nothing else.
+        return {"legal": False, "problems": problems,
+                "out": [p["name"] for p in outs], "in": [p["name"] for p in ins],
+                "note": "This move cannot be made, so it has not been scored."}
+    return {
+        "legal": True,
+        "problems": [],
+        "out": [{"name": p["name"], "pos": p["pos"], "sellFor": p["sell"],
+                 "xPtsNext5": p.get("proj5")} for p in outs],
+        "in": [{"name": p["name"], "pos": p["pos"], "price": p["price"],
+                "xPtsNext5": p.get("proj5")} for p in ins],
+        "moneyLeftOver": round(funds - cost, 1),
+        "freeTransfersAssumed": free,
+        "pointsHit": hits,
+        "xiGainNext5": round(gain5, 1),
+        "xiGainNextMatch": round(gain1, 2),
+        "netAfterHit": round(gain5 - hits, 1),
+        "note": ("Gains are measured on the eleven that would actually play, not on "
+                 "all fifteen, so upgrading a player who would stay benched shows as "
+                 "little or nothing."),
+    }
+
+
+def chat_context(payload, entry):
+    """The compact briefing the model gets about this specific team."""
+    mm = (payload.get("managers") or {}).get(str(entry)) or {}
+    idx = _pindex(payload)
+    L = mm.get("lineup") or {}
+    nm = lambda i: (idx.get(i) or {}).get("name", "?")
+
+    lines = ["THE TEAM YOU ARE ADVISING: %s, run by %s." % (mm.get("team"), mm.get("mgr")),
+             "Gameweek %s is next. League position %s of %s, %s points."
+             % (payload["meta"].get("planGw") or payload["meta"].get("gw"),
+                mm.get("rank"), len(payload.get("standings") or []), mm.get("total")),
+             "Budget: %.1fm squad value, %.1fm in the bank."
+             % (mm["budget"]["squadValue"], mm["budget"]["bank"]) if mm.get("budget") else "",
+             "Free transfers assumed: %s (the public API does not report the real number)."
+             % mm.get("freeTransfers", 1),
+             "", "SQUAD (xPts next match / next five / price / sells for):"]
+    for pk in mm.get("picks", []):
+        p = idx.get(pk["id"])
+        if not p:
+            continue
+        tag = []
+        if pk.get("isCap"):
+            tag.append("captain")
+        if pk.get("isVice"):
+            tag.append("vice")
+        tag.append("starting" if pk.get("starting") else "benched")
+        if p.get("status") and p["status"] != "a":
+            tag.append("FITNESS DOUBT (%s)" % p["status"])
+        runs = ((payload.get("fixtures") or {}).get(p["club"]) or {}).get("runs") or []
+        fx = " ".join("%s%s(%s)" % (r.get("opp"), r.get("ha"), r.get("fdr"))
+                      for r in runs if r.get("opp"))
+        lines.append("  %-3s %-18s %-4s %5.2f / %5.1f / %4.1fm / %4.1fm  [%s]  %s"
+                     % (p["pos"], p["name"], p["club"], p.get("xp1") or 0,
+                        p.get("proj5") or 0, p["price"], pk.get("sell") or 0,
+                        ", ".join(tag), fx))
+
+    if L:
+        lines += ["", "WHAT THE MODEL WOULD FIELD THIS WEEK: %s, %s expected points "
+                      "(%s with the captain doubled)."
+                  % (L.get("formation"), L.get("xiPoints"), L.get("withCaptain")),
+                  "  Captain %s, vice %s. Bench in order: %s."
+                  % (nm(L.get("captain")), nm(L.get("vice")),
+                     ", ".join(nm(i) for i in L.get("bench", [])) or "-"),
+                  "  Against what is currently picked that is worth %s points."
+                  % L.get("gain")]
+        if L.get("closeCalls"):
+            lines.append("  Genuinely close: " + "; ".join(
+                "%s over %s by %.2f" % (nm(c["in"]), nm(c["out"]), c["gap"])
+                for c in L["closeCalls"]))
+        ch = L.get("chips") or {}
+        lines.append("  Bench Boost would be worth %s. Triple Captain would add %s."
+                     % (ch.get("benchBoost"), ch.get("tripleCaptain")))
+    if mm.get("chipsUsed"):
+        lines.append("  Chips already played: " + "; ".join(
+            "%s in GW%s" % (c["name"], "/".join(str(g) for g in c["gws"]))
+            for c in mm["chipsUsed"]))
+
+    B = mm.get("bundles") or {}
+    if B.get("2") or B.get("3"):
+        lines += ["", "TRANSFER BUNDLES ALREADY COMPUTED (net is after the points hit):"]
+        for k in ("2", "3"):
+            for b in (B.get(k) or [])[:4]:
+                pairs = "; ".join("%s -> %s" % (nm(pr["out"]), nm(pr["in"]))
+                                  for pr in b.get("pairs", []))
+                lines.append("  %s moves: %s | eleven gains %s, hit -%s, net %s%s"
+                             % (k, pairs, b["gain"], b["hits"], b["net"],
+                                " [reallocation]" if b.get("reallocation") else ""))
+    tx = mm.get("transfers") or []
+    if tx:
+        lines += ["", "BEST SINGLE SWAPS:"]
+        for t in tx[:6]:
+            lines.append("  %s -> %s, gain %s over five"
+                         % (nm(t["outId"]), nm(t["inId"]), t["gain5"]))
+
+    st = payload.get("standings") or []
+    if st:
+        lines += ["", "MINI-LEAGUE: " + ", ".join(
+            "%s %s (%s pts)" % (s.get("rank"), s.get("team") or s.get("entry_name"),
+                                s.get("total")) for s in st[:10])]
+
+    o = payload.get("odds") or {}
+    lines += ["", "DATA NOTES: fixture difficulty is the betting market's win chance minus "
+                  "lose chance where a match is priced (%s fixtures right now), and the "
+                  "results-based model beyond that. Expected points come from last season's "
+                  "per-90 rates updated by this season, crossing over around eleven matches "
+                  "played. A typical model of this kind is about 5 points out on players who "
+                  "haul, so treat gaps of a point or two as noise."
+              % (o.get("priced") if o.get("status") == "on" else "no")]
+    return "\n".join(l for l in lines if l != "")
+
+
+CHAT_SYSTEM = """You are the assistant inside FPL Dugout, a Fantasy Premier League
+dashboard. You are talking to the manager whose team is described below.
+
+HOW TO BE USEFUL HERE
+
+Answer about THIS squad, using the numbers you are given. Generic Fantasy advice
+is not what this is for -- the person can read that anywhere. Quote the actual
+expected points, prices and fixtures.
+
+For any "what if" -- any combination of transfers the briefing does not already
+price -- call score_transfers. Do not estimate. The tool runs the same arithmetic
+the app runs, including whether the move is even legal. If someone asks about a
+player not in the briefing, call find_players.
+
+Recommend. When the numbers point somewhere, say so plainly rather than laying
+out options and retreating. But the gaps are often inside the error bars, and
+when they are, say that too: "these are within a point, so it is a coin toss and
+team news should decide it" is a better answer than false precision.
+
+WHAT THE NUMBERS ARE AND ARE NOT
+
+Expected points are a forecast in real FPL points, so they can be weighed
+directly against a 4-point hit. They are not certainty: the published research
+puts even a trained model around 5 points of error on the players who actually
+haul. A one or two point edge over five matches is noise, and you should say so.
+
+The model cannot see team news, press conferences, rotation for cup or European
+matches, or whether a player is genuinely nailed on. That is the single biggest
+gap and it is worth naming when a decision hinges on it.
+
+Fixture difficulty here runs 1 to 5 where 3 is an even match, derived from win
+probability -- not from how good the opponent is. A strong team at home to
+another strong team can read 2 while being a hard game for a clean sheet. If
+that distinction matters to the answer, explain it.
+
+STYLE
+
+Conversational and brief. Plain prose, not headed reports. A short table only
+when comparing several players on the same measures. No bullet lists of caveats.
+Do not restate the question. Never invent a number: if you do not have it and no
+tool gives it to you, say so.""" + "\n\n" + FPL_RULES
+
+
+def chat_answer(messages, entry, payload):
+    """One turn, including any tool calls the model needs. Returns (reply, meta)."""
+    if not ANTHROPIC_KEY:
+        return None, {"error": "No ANTHROPIC_API_KEY is set on the server, so the "
+                               "assistant is switched off."}
+    _chat_month()
+    if _chat["questions"] >= CHAT_MAX_MONTH:
+        return None, {"error": "The monthly limit of %d question%s has been reached. "
+                               "It resets on the first of the month."
+                               % (CHAT_MAX_MONTH, "" if CHAT_MAX_MONTH == 1 else "s")}
+
+    model = chat_model()
+    convo = [{"role": m["role"], "content": m["content"]} for m in messages
+             if m.get("role") in ("user", "assistant") and m.get("content")][-16:]
+    if not convo or convo[-1]["role"] != "user":
+        return None, {"error": "nothing to answer"}
+
+    system = [
+        {"type": "text", "text": CHAT_SYSTEM,
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": chat_context(payload, entry)},
+    ]
+    used_tools = []
+    for _ in range(5):
+        body = {"model": model, "max_tokens": CHAT_MAX_TOKENS,
+                "system": system, "messages": convo, "tools": CHAT_TOOLS}
+        try:
+            res = _anthropic("/v1/messages", body)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+            except Exception:                                # noqa: BLE001
+                pass
+            msg = {401: "the API key was rejected",
+                   429: "rate limited by the API, try again shortly",
+                   400: "the request was rejected: " + detail,
+                   529: "the API is overloaded, try again shortly"}.get(
+                       e.code, "the API returned HTTP %d. %s" % (e.code, detail))
+            _chat["lastError"] = msg
+            _chat_save()
+            return None, {"error": msg}
+        except Exception as e:                               # noqa: BLE001
+            _chat["lastError"] = str(e)
+            _chat_save()
+            return None, {"error": "could not reach the API (%s)" % e}
+
+        u = res.get("usage") or {}
+        _chat["in"] += int(u.get("input_tokens") or 0)
+        _chat["out"] += int(u.get("output_tokens") or 0)
+        _chat["cacheRead"] += int(u.get("cache_read_input_tokens") or 0)
+        _chat["cacheWrite"] += int(u.get("cache_creation_input_tokens") or 0)
+        _chat["model"] = res.get("model") or model
+
+        blocks = res.get("content") or []
+        calls = [b for b in blocks if b.get("type") == "tool_use"]
+        if res.get("stop_reason") == "tool_use" and calls:
+            convo.append({"role": "assistant", "content": blocks})
+            results = []
+            for c in calls:
+                try:
+                    if c["name"] == "score_transfers":
+                        out = tool_score_transfers(payload, entry, c.get("input") or {})
+                    elif c["name"] == "find_players":
+                        out = tool_find_players(payload, c.get("input") or {})
+                    else:
+                        out = {"error": "unknown tool"}
+                except Exception as e:                       # noqa: BLE001
+                    out = {"error": "%s: %s" % (type(e).__name__, e)}
+                used_tools.append({"name": c["name"], "input": c.get("input")})
+                results.append({"type": "tool_result", "tool_use_id": c["id"],
+                                "content": json.dumps(out)})
+            convo.append({"role": "user", "content": results})
+            continue
+
+        text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        _chat["questions"] += 1
+        _chat_save()
+        return text, {"model": _chat["model"], "tools": used_tools,
+                      "spend": chat_spend()}
+
+    _chat["questions"] += 1
+    _chat_save()
+    return None, {"error": "gave up after five rounds of tool calls"}
+
+
+_chat_load()
+
+
+def season_of(events):
+    """Which season these fixtures belong to, as FPL labels it (e.g. 2026-27).
+
+    Taken from the first deadline of the campaign, which always falls in August.
+    """
+    firsts = [e.get("deadline_time") for e in events if e.get("deadline_time")]
+    if not firsts:
+        return None
+    y = int(min(firsts)[:4])
+    return "%d-%02d" % (y, (y + 1) % 100)
+
+
+def prior_is_current(events):
+    """Is the embedded last-season table still the season immediately past?
+
+    The table is baked into this file because last season cannot change. That is
+    true right up until a new season starts, at which point the priors quietly
+    become a year out of date and nothing would otherwise say so. Rather than let
+    that rot in silence, compare what the fixtures say the season is against what
+    the table was built from.
+    """
+    cur = season_of(events)
+    if not cur:
+        return True, None, None
+    want = "%d-%02d" % (int(cur[:4]) - 1, int(cur[:4]) % 100)
+    return (want == PRIOR_SEASON), want, cur
+
+
 def build_payload(entry_id, league_id):
     """Everything the UI needs, with a full perspective computed per manager.
 
@@ -2245,6 +2827,7 @@ def build_payload(entry_id, league_id):
 
     return {
         "meta": {
+            "planGw": plan_from,
             "gw": gw, "planFrom": plan_from,
             "gwName": (cur or nxt or events[0]).get("name"),
             "deadline": (nxt or {}).get("deadline_time"),
@@ -2255,8 +2838,13 @@ def build_payload(entry_id, league_id):
                       "formGws": hist_gws, "formWindow": FORM_WINDOW,
                       "priorMatches": PRIOR_MATCHES, "homeAdv": HOME_ADV,
                       "priorSeason": PRIOR_SEASON,
+                      "season": season_of(events),
+                      "priorStale": (lambda t: None if t[0] else
+                                     {"have": PRIOR_SEASON, "want": t[1], "season": t[2]})(
+                                        prior_is_current(events)),
                       "priorCoverage": sum(1 for e in els if e.get("_hasPrior")),
                       "priorMins": PRIOR_MINS, "horizon": HORIZON},
+            "chat": chat_spend(),
         },
         "myEntry": entry_id,
         "league": league,
@@ -2353,6 +2941,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/data":
             try:
                 data = build_payload(self.entry_id, self.league_id)
+                with _lock:
+                    _payload_cache["t"] = time.time()
+                    _payload_cache["data"] = data
                 return self._send(200, json.dumps(data), "application/json")
             except FPLError as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
@@ -2364,8 +2955,50 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/refresh":
             with _lock:
                 _cache.clear()
+                _payload_cache["t"] = 0.0
             return self._send(200, json.dumps({"ok": True}), "application/json")
         self._send(404, "not found", "text/plain; charset=utf-8")
+
+    def _payload(self):
+        """The chat reuses whatever the interface last rendered rather than
+        rebuilding the model on every message, which would add seconds and, on a
+        free-tier host, rather more."""
+        with _lock:
+            hit = _payload_cache["data"]
+            fresh = hit is not None and time.time() - _payload_cache["t"] < 300
+        if fresh:
+            return hit
+        data = build_payload(self.entry_id, self.league_id)
+        with _lock:
+            _payload_cache["t"] = time.time()
+            _payload_cache["data"] = data
+        return data
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if not self._authed():
+            return
+        if path != "/api/chat":
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 200000:
+                return self._send(200, json.dumps(
+                    {"error": "message too long"}), "application/json")
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except Exception as e:                               # noqa: BLE001
+            return self._send(200, json.dumps(
+                {"error": "bad request (%s)" % e}), "application/json")
+        try:
+            payload = self._payload()
+            entry = req.get("entry") or payload.get("myEntry")
+            reply, meta = chat_answer(req.get("messages") or [], entry, payload)
+            body = {"reply": reply}
+            body.update(meta or {})
+            return self._send(200, json.dumps(body), "application/json")
+        except Exception as e:                               # noqa: BLE001
+            return self._send(200, json.dumps(
+                {"error": "%s: %s" % (type(e).__name__, e)}), "application/json")
 
 
 PAGE = r"""<!doctype html>
@@ -2589,6 +3222,44 @@ main{padding-top:24px}
 .rtag{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:8.5px;
   letter-spacing:.06em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);
   border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:2px}
+.chatpanel{position:fixed;top:0;right:0;width:min(460px,100vw);height:100vh;z-index:60;
+  background:var(--card);border-left:1px solid var(--line);display:flex;flex-direction:column;
+  box-shadow:-14px 0 40px rgba(0,0,0,.14)}
+.chathead{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;
+  padding:13px 14px;border-bottom:1px solid var(--line);flex:none}
+.chathead b{display:block;font-size:14px}
+.chathead small{display:block;color:var(--muted);font-family:"IBM Plex Mono",monospace;font-size:9.5px;margin-top:2px}
+.chatbody{flex:1;overflow-y:auto;padding:13px 14px;display:flex;flex-direction:column;gap:10px}
+.cmsg{max-width:100%;font-size:13px;line-height:1.5}
+.cmsg.you{align-self:flex-end;background:var(--accent);color:#fff;border-radius:11px 11px 3px 11px;
+  padding:8px 11px;max-width:85%;white-space:pre-wrap}
+.cmsg.bot{background:var(--sunk);border:1px solid var(--line);border-radius:11px 11px 11px 3px;padding:9px 12px}
+.cmsg.bot p{margin:0 0 7px} .cmsg.bot p:last-child{margin:0}
+.cmsg.bot code{font-family:"IBM Plex Mono",monospace;font-size:11.5px;background:var(--card);padding:1px 4px;border-radius:3px}
+.cmsg.thinking{color:var(--muted);font-style:italic}
+.chattbl{border-collapse:collapse;font-size:11.5px;margin:6px 0;width:100%}
+.chattbl th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9px;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--muted);border-bottom:1px solid var(--line);padding:2px 8px 3px 0}
+.chattbl td{padding:3px 8px 3px 0;border-bottom:1px solid var(--line)}
+.ctool{margin-top:7px;padding-top:6px;border-top:1px dashed var(--line);
+  font-family:"IBM Plex Mono",monospace;font-size:9px;color:var(--muted)}
+.chatempty p{font-size:12.5px;color:var(--ink2);margin:0 0 11px}
+.seeds{display:flex;flex-direction:column;gap:6px}
+.seed{text-align:left;background:var(--sunk);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;font-size:12px;cursor:pointer;font-family:inherit;color:var(--ink)}
+.seed:hover{border-color:var(--accent);color:var(--accent)}
+.chatform{flex:none;display:flex;gap:7px;padding:11px 14px;border-top:1px solid var(--line);align-items:flex-end}
+.chatform textarea{flex:1;resize:none;font:inherit;font-size:13px;padding:8px 10px;border-radius:8px;
+  border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+.chatform textarea:focus{outline:none;border-color:var(--accent)}
+@media(max-width:640px){.chatpanel{width:100vw}}
+.spendgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px;margin:10px 0 6px}
+.spendcell{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--sunk)}
+.spendcell b{display:block;font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--muted);font-weight:600}
+.spendcell span{display:block;font-family:"IBM Plex Mono",monospace;font-size:19px;font-weight:700;margin-top:3px}
+.spendbar{height:7px;border-radius:4px;background:var(--sunk);border:1px solid var(--line);overflow:hidden;margin:4px 0 2px}
+.spendbar i{display:block;height:100%;background:var(--accent)}
 table.bands{border-collapse:collapse;margin:10px 0 14px;font-size:13px}
 table.bands th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9.5px;
   letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
@@ -2868,6 +3539,8 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
       <span class="viewbar" id="viewbar" hidden>viewing <b id="viewname"></b>
         <button class="btn ghost" id="changeteam" type="button">Change</button></span>
       <span class="livedot" id="livedot"></span>
+      <button class="btn ghost" id="chatbtn" type="button"
+        title="Ask a question about this squad">Ask</button>
       <button class="btn ghost" id="refresh" type="button">Refresh</button>
     </div>
     <div class="strip" id="strip"></div>
@@ -2897,6 +3570,7 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
   <div id="boot" class="loading">Fetching live data from the FPL API...</div>
   <div id="app" hidden>
     <div id="banner"></div>
+    <aside class="chatpanel" id="chatpanel" hidden></aside>
     <section id="picker" hidden></section>
     <section class="panel" id="p-home"></section>
     <section class="panel" id="p-squad" hidden>
@@ -3560,6 +4234,7 @@ function deadlineText(){
 
 /* ---------------- Home ---------------- */
 function renderHome(){
+  var _pw=priorWarning();
   var mm=M(), sq=squadOf(), dl=deadlineText();
   var lead=D.standings[0], gap=lead?lead.total-mm.total:null;
   var h=intro('Everything worth doing this week, in one place. Each card links to the '+
@@ -3633,7 +4308,7 @@ function renderHome(){
       '</div><button class="go" data-go="squad">Open my team</button></div>';
   }
   h+='</div>';
-  $("#p-home").innerHTML=h;
+  $("#p-home").innerHTML=_pw+h;
   wireImgs($("#p-home"));
 }
 function getOrdinal(n){
@@ -3920,11 +4595,140 @@ function renderLeague(){
 }
 
 /* ---------------- Model ---------------- */
+function priorWarning(){
+  var s=(D.meta.model||{}).priorStale;
+  if(!s) return '';
+  return '<div class="msg warn"><b>The last-season data in this app is out of date.</b> '+
+    'It holds '+esc(s.have)+' rates, but the season now running is '+esc(s.season)+
+    ', so the priors should come from '+esc(s.want)+'. Player ratings will lean on figures '+
+    'a year older than they should until the table is rebuilt. Everything else — fixtures, '+
+    'results, prices, odds — is still live.</div>';
+}
+/* ---------------- ask a question about your own team ---------------- */
+var chatLog=[], chatBusy=false;
+function chatOpen(seed){
+  $("#chatpanel").hidden=false;
+  document.body.classList.add("chaton");
+  if(seed){ $("#chatinput").value=seed; }
+  setTimeout(function(){ $("#chatinput").focus() },60);
+  renderChat();
+}
+function chatClose(){ $("#chatpanel").hidden=true; document.body.classList.remove("chaton"); }
+function mdLite(s){
+  // deliberately small: bold, code, tables and paragraphs. No HTML passes through.
+  s=esc(s);
+  var out=[], rows=null;
+  s.split("\n").forEach(function(line){
+    if(/^\s*\|.*\|\s*$/.test(line)){
+      var cells=line.replace(/^\s*\|/,"").replace(/\|\s*$/,"").split("|").map(function(c){return c.trim()});
+      if(cells.every(function(c){return /^:?-{2,}:?$/.test(c)})) return;
+      rows=rows||[]; rows.push(cells); return;
+    }
+    if(rows){ out.push(tbl(rows)); rows=null; }
+    if(!line.trim()){ out.push(""); return; }
+    out.push("<p>"+line+"</p>");
+  });
+  if(rows) out.push(tbl(rows));
+  function tbl(r){
+    return '<table class="chattbl"><thead><tr>'+r[0].map(function(c){return "<th>"+c+"</th>"}).join("")+
+      '</tr></thead><tbody>'+r.slice(1).map(function(row){
+        return "<tr>"+row.map(function(c){return "<td>"+c+"</td>"}).join("")+"</tr>"}).join("")+
+      '</tbody></table>';
+  }
+  return out.join("").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>").replace(/`([^`]+)`/g,"<code>$1</code>");
+}
+function renderChat(){
+  var mm=M();
+  var sp=(D.meta&&D.meta.chat)||{};
+  var head='<div class="chathead"><div><b>Ask about '+esc(mm?mm.team:"this team")+'</b>'+
+    '<small>'+(sp.on?('grounded in this squad · '+sp.left+' of '+sp.cap+' questions left this month')
+                    :'no API key set on the server')+'</small></div>'+
+    '<button class="btn ghost" id="chatx" type="button">Close</button></div>';
+  var body;
+  if(!sp.on){
+    body='<div class="msg warn">The assistant is switched off because no '+
+      '<code>ANTHROPIC_API_KEY</code> is set on the server. Add one in the Render dashboard '+
+      'and restart the service.</div>';
+  } else if(!chatLog.length){
+    body='<div class="chatempty"><p>Ask anything about this squad. It can see your fifteen, '+
+      'your budget, the fixtures, the odds and every bundle it has computed — and it will run '+
+      'the real arithmetic for combinations it has not scored yet.</p>'+
+      '<div class="seeds">'+
+      ['Should I take the three-transfer bundle or hold?',
+       'What do I actually lose by selling Haaland?',
+       'Who should captain this week and how close is it?',
+       'Is my bench strong enough for Bench Boost?',
+       'Explain why it wants me to bench my defender'
+      ].map(function(q){return '<button class="seed" type="button">'+esc(q)+'</button>'}).join("")+
+      '</div></div>';
+  } else {
+    body=chatLog.map(function(m){
+      if(m.role==="user") return '<div class="cmsg you">'+esc(m.content)+'</div>';
+      if(m.error) return '<div class="msg warn">'+esc(m.error)+'</div>';
+      return '<div class="cmsg bot">'+mdLite(m.content||"")+
+        (m.tools&&m.tools.length?'<div class="ctool">ran '+m.tools.map(function(t){
+          return esc(t.name)}).join(", ")+' against the live model</div>':'')+'</div>';
+    }).join("");
+  }
+  if(chatBusy) body+='<div class="cmsg bot thinking">thinking…</div>';
+  $("#chatpanel").innerHTML=head+'<div class="chatbody" id="chatbody">'+body+'</div>'+
+    '<form class="chatform" id="chatform"><textarea id="chatinput" rows="2" '+
+    'placeholder="'+(sp.on?"Ask about transfers, captaincy, who to bench…":"Unavailable")+'"'+
+    (sp.on?"":" disabled")+'></textarea>'+
+    '<button class="btn" type="submit"'+(sp.on&&!chatBusy?"":" disabled")+'>Ask</button></form>';
+  var b=$("#chatbody"); if(b) b.scrollTop=b.scrollHeight;
+}
+function chatSend(text){
+  if(!text||chatBusy) return;
+  chatLog.push({role:"user",content:text});
+  chatBusy=true; renderChat();
+  fetch("/api/chat",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({entry:viewEntry,
+      messages:chatLog.filter(function(m){return !m.error}).map(function(m){
+        return {role:m.role,content:m.content}})})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    chatBusy=false;
+    if(d.error) chatLog.push({role:"assistant",error:d.error});
+    else {
+      chatLog.push({role:"assistant",content:d.reply||"(no answer)",tools:d.tools});
+      if(d.spend&&D.meta) D.meta.chat=d.spend;
+    }
+    renderChat();
+    // the spend tracker lives on a tab that is probably hidden right now, so
+    // re-render it regardless -- otherwise it shows the count as of page load
+    if($("#p-model")) renderModel();
+  })
+  .catch(function(e){ chatBusy=false;
+    chatLog.push({role:"assistant",error:"Could not reach the server: "+e});
+    renderChat(); });
+}
+document.addEventListener("click",function(e){
+  if(e.target.id==="chatbtn"||e.target.closest("#chatbtn")) return chatOpen();
+  if(e.target.id==="chatx") return chatClose();
+  var s=e.target.closest(".seed");
+  if(s){ chatSend(s.textContent); }
+});
+document.addEventListener("submit",function(e){
+  if(e.target.id!=="chatform") return;
+  e.preventDefault();
+  var v=$("#chatinput").value.trim();
+  $("#chatinput").value="";
+  chatSend(v);
+});
+document.addEventListener("keydown",function(e){
+  if(e.key==="Escape"&&!$("#chatpanel").hidden) chatClose();
+  if(e.target&&e.target.id==="chatinput"&&e.key==="Enter"&&!e.shiftKey){
+    e.preventDefault();
+    var v=e.target.value.trim(); e.target.value=""; chatSend(v);
+  }
+});
+
 function renderModel(){
   var w=D.meta.model, mm=M(), b=mm.budget;
   var capped=Object.keys(mm.clubCounts).filter(function(k){return mm.clubCounts[k]>=3});
   var mp=w.matchesPlayed||0;
-  $("#p-model").innerHTML=intro('Every player carries a number of <b>expected points</b> — '+
+  $("#p-model").innerHTML=priorWarning()+intro('Every player carries a number of <b>expected points</b> — '+
     'a forecast of what he will actually score, in the same units FPL awards. That is the '+
     'point of it: you can weigh a move against the −4 you pay for an extra transfer, and you '+
     'can add eleven of them up and compare formations. Tap <b>?</b> on any transfer, or open '+
@@ -4130,6 +4934,37 @@ function renderModel(){
   'a root-mean-square error of about 5 points on the players who actually haul. This is a '+
   'hand-built heuristic, not a trained model, so treat it as a way of ranking options and '+
   'surfacing things you might miss — not as a points forecast.</p>'+
+
+  '<h3>The assistant, and what it costs</h3>'+
+  (function(){
+    var c=(D.meta&&D.meta.chat)||{};
+    if(!c.on) return '<p>The <b>Ask</b> button is switched off: no <code>ANTHROPIC_API_KEY</code> '+
+      'is set on the server. With one, the assistant can answer questions about this squad and '+
+      'run real transfer arithmetic for combinations the app has not already scored.</p>';
+    var pct=Math.min(100,Math.round(100*c.questions/Math.max(1,c.cap)));
+    return '<p>The <b>Ask</b> button opens an assistant that can see this squad, the fixtures, '+
+      'the odds and every bundle computed here, and knows the rules of the game. When you ask '+
+      'about a combination it has not scored, it calls back into the same transfer engine the '+
+      'Transfers tab uses rather than guessing — so its numbers are the app’s numbers.</p>'+
+      '<div class="spendgrid">'+
+      '<div class="spendcell"><b>Questions this month</b><span>'+c.questions+'</span></div>'+
+      '<div class="spendcell"><b>Spent</b><span>$'+(c.cost||0).toFixed(2)+'</span></div>'+
+      '<div class="spendcell"><b>Per question</b><span>'+
+        (c.perQuestion==null?'—':'$'+c.perQuestion.toFixed(3))+'</span></div>'+
+      '<div class="spendcell"><b>Left in the cap</b><span>'+c.left+'</span></div></div>'+
+      '<div class="spendbar"><i style="width:'+pct+'%"></i></div>'+
+      '<p class="dim">'+c.questions+' of '+c.cap+' questions used in '+esc(c.month)+
+      '. The cap is a hard stop: at '+c.cap+' the assistant switches off until the month rolls '+
+      'over. Tokens so far: '+(c.inTokens||0).toLocaleString()+' in, '+
+      (c.outTokens||0).toLocaleString()+' out'+
+      ((c.cacheRead||0)?', '+c.cacheRead.toLocaleString()+' read from cache at a tenth of the price':'')+
+      '. Priced at $'+c.priceIn+' per million in and $'+c.priceOut+' per million out'+
+      (c.model?' for <code>'+esc(c.model)+'</code>':'')+'.</p>'+
+      '<p class="dim">This counter lives on the server’s disk, which Render wipes on every '+
+      'redeploy — so after you push an update it restarts from zero even though your real bill '+
+      'does not. The Anthropic console is the authority on what you have actually spent.'+
+      (c.lastError?' Last error: <b>'+esc(c.lastError)+'</b>.':'')+'</p>';
+  })()+
 
   '<h3>Budget — '+esc(mm.team)+'</h3><p>Spending power is <b>'+m(b.total)+'</b> — '+
   m(b.squadValue)+' of squad plus '+m(b.bank)+' banked. A swap is offered only if the incoming '+
