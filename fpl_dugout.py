@@ -437,7 +437,7 @@ def odds_by_fixture(fixtures, teams):
             unmatched.append("%s v %s" % (p["home"], p["away"]))
             continue
         for f in fixtures:
-            if f.get("finished") or f["team_h"] != h or f["team_a"] != a:
+            if is_played(f) or f["team_h"] != h or f["team_a"] != a:
                 continue
             priced[f["id"]] = p
             break
@@ -454,6 +454,24 @@ def odds_by_fixture(fixtures, teams):
 # league average so that one freak result does not dominate in August.
 PRIOR_MATCHES = 6.0        # weight of the "league average" prior, in matches
 HOME_ADV = 1.15            # goals multiplier at home, /1.15 away
+
+
+def is_played(f):
+    """Has this match been played, as far as the scoreline is concerned?
+
+    FPL sets `finished` only once bonus points have been confirmed, which lags
+    the final whistle by a day or more -- through that window a whole round of
+    football has been played and `finished` is still false on every fixture of
+    it. `finished_provisional` goes true at full time.
+
+    Everything here reads scorelines, and a scoreline does not change when bonus
+    is applied, so the provisional flag is the right one. Using `finished` meant
+    the league table and the team ratings both ignored the most recent round
+    until FPL got round to awarding three bonus points.
+    """
+    return bool((f.get("finished") or f.get("finished_provisional"))
+                and f.get("team_h_score") is not None
+                and f.get("team_a_score") is not None)
 
 
 def fdr_prior(fixtures, teams):
@@ -490,9 +508,7 @@ def team_strength(fixtures, teams):
     """Attack and defence multipliers per team, 1.0 = league average."""
     rec = {t["id"]: {"gf": 0.0, "ga": 0.0, "p": 0} for t in teams}
     prior = fdr_prior(fixtures, teams)
-    done = [f for f in fixtures
-            if f.get("finished") and f.get("team_h_score") is not None
-            and f.get("team_a_score") is not None]
+    done = [f for f in fixtures if is_played(f)]
     for f in done:
         h, a = rec.get(f["team_h"]), rec.get(f["team_a"])
         if not h or not a:
@@ -1537,9 +1553,7 @@ def league_table(fixtures, teams):
         rec[t["id"]] = {"id": t["id"], "name": t["name"], "short": t["short_name"],
                         "code": int(num(t.get("code"))), "p": 0, "w": 0, "d": 0, "l": 0,
                         "gf": 0, "ga": 0, "pts": 0, "form": []}
-    done = [f for f in fixtures
-            if f.get("finished") and f.get("team_h_score") is not None
-            and f.get("team_a_score") is not None]
+    done = [f for f in fixtures if is_played(f)]
     done.sort(key=lambda f: (f.get("event") or 0, f.get("kickoff_time") or ""))
     for f in done:
         h, a = rec.get(f["team_h"]), rec.get(f["team_a"])
@@ -1912,6 +1926,31 @@ def replacement_level(els):
     return out
 
 
+CHIP_NAMES = {"3xc": "Triple Captain", "bboost": "Bench Boost",
+              "freehit": "Free Hit", "wildcard": "Wildcard",
+              "manager": "Assistant Manager"}
+CHIP_ALLOWANCE = 2         # 2026-27 gives two of each, one per half of the season
+
+
+def chips_used(history):
+    """Which chips this manager has already spent, and in which gameweek.
+
+    The picks endpoint only says what was active in the round you asked for, so
+    on its own it cannot tell "playing a chip now" apart from "played one last
+    week". The history endpoint carries the whole list, which is what makes the
+    difference statable.
+    """
+    out = {}
+    for c in ((history or {}).get("chips") or []):
+        name = c.get("name")
+        if not name:
+            continue
+        out.setdefault(name, []).append(c.get("event"))
+    return [{"key": k, "name": CHIP_NAMES.get(k, k), "gws": sorted(v),
+             "used": len(v), "left": max(0, CHIP_ALLOWANCE - len(v))}
+            for k, v in sorted(out.items())]
+
+
 def build_payload(entry_id, league_id):
     """Everything the UI needs, with a full perspective computed per manager.
 
@@ -1928,6 +1967,15 @@ def build_payload(entry_id, league_id):
     nxt = next((e for e in events if e.get("is_next")), None)
     gw = (cur or nxt or events[0])["id"]
     plan_from = (nxt or cur or events[0])["id"]
+    # Between the final whistle of one round and the deadline of the next, the
+    # API still reports the finished round as current. Picks fetched then are
+    # LAST week's, chip included -- so record whether that round is over and
+    # never describe its chip as active.
+    # Careful with the test. is_next appears the moment a deadline passes, so
+    # "plan_from != gw" is true all the way through a round being played, and
+    # would call a chip spent while it is still scoring. The round being over is
+    # the only signal that means what it says.
+    picks_gw_done = bool((cur or {}).get("finished")) or cur is None
 
     teams = {t["id"]: t for t in boot["teams"]}
 
@@ -1990,7 +2038,7 @@ def build_payload(entry_id, league_id):
         except FPLError:
             pass
 
-    picks_by_entry, entry_by_entry = {}, {}
+    picks_by_entry, entry_by_entry, hist_by_entry = {}, {}, {}
     for r in rows:
         try:
             picks_by_entry[r["entry"]] = fetch(
@@ -2001,6 +2049,10 @@ def build_payload(entry_id, league_id):
             entry_by_entry[r["entry"]] = fetch("/entry/%d/" % r["entry"], ttl=300)
         except FPLError:
             entry_by_entry[r["entry"]] = {}
+        try:
+            hist_by_entry[r["entry"]] = fetch("/entry/%d/history/" % r["entry"], ttl=300)
+        except FPLError:
+            hist_by_entry[r["entry"]] = {}
 
     def ids_of(entry):
         rp = picks_by_entry.get(entry)
@@ -2166,6 +2218,8 @@ def build_payload(entry_id, league_id):
             "rank": r["rank"], "total": r["total"], "gw": r["event_total"],
             "overallRank": ent.get("summary_overall_rank"),
             "value": value, "bank": bank, "chip": (rp or {}).get("active_chip"),
+            "chipGw": gw, "chipSpent": picks_gw_done,
+            "chipsUsed": chips_used(hist_by_entry.get(entry)),
             "budget": {"squadValue": round(value / 10, 1), "bank": round(bank / 10, 1),
                        "total": round((value + bank) / 10, 1)},
             "clubCounts": {teams[k]["short_name"]: v for k, v in club_count.items()},
@@ -2210,7 +2264,8 @@ def build_payload(entry_id, league_id):
                        "mgr": r["player_name"], "gw": r["event_total"], "total": r["total"],
                        "value": managers[str(r["entry"])]["value"],
                        "bank": managers[str(r["entry"])]["bank"],
-                       "chip": managers[str(r["entry"])]["chip"]}
+                       "chip": managers[str(r["entry"])]["chip"],
+                       "chipSpent": picks_gw_done, "chipGw": gw}
                       for r in rows if str(r["entry"]) in managers],
         "managers": managers,
         "players": players,
@@ -2219,7 +2274,8 @@ def build_payload(entry_id, league_id):
             {"gw": f.get("event"), "ko": f.get("kickoff_time"),
              "h": f["team_h"], "a": f["team_a"],
              "hs": f.get("team_h_score"), "as": f.get("team_a_score"),
-             "fin": bool(f.get("finished")),
+             "fin": is_played(f),
+             "prov": bool(f.get("finished_provisional") and not f.get("finished")),
              "hd": f.get("team_h_difficulty"), "ad": f.get("team_a_difficulty")}
             for f in sorted(fixtures, key=lambda x: ((x.get("event") or 99),
                                                      x.get("kickoff_time") or ""))
@@ -2519,6 +2575,8 @@ main{padding-top:24px}
 .sechead{font-size:17px;margin:22px 0 4px}
 .subhead{font-size:13px;margin:16px 0 7px;font-family:"IBM Plex Mono",monospace;
   text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+.chipused{display:block;margin-top:6px;font-style:normal;font-family:"IBM Plex Mono",monospace;
+  font-size:9.5px;color:var(--muted);border-top:1px solid var(--line);padding-top:5px}
 .bundle{border:1px solid var(--line);border-radius:9px;padding:11px 12px;margin-bottom:9px;background:var(--card)}
 .bundle.realloc{border-color:var(--accent)}
 .bhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:7px}
@@ -3147,7 +3205,8 @@ function renderSquad(){
   }
   var h='<div class="pitchhead"><h3>'+esc(mm.team)+'</h3><span class="meta">'+
     esc(mm.mgr)+' · '+mm.total+' pts · '+m(mm.budget.squadValue)+' squad · '+
-    m(mm.budget.bank)+' bank'+(mm.chip?' · '+esc(mm.chip):'')+'</span></div>';
+    m(mm.budget.bank)+' bank'+(mm.chip?' · '+esc(chipLabel(mm.chip))+
+    (mm.chipSpent?' (played GW'+mm.chipGw+')':' active'):'')+'</span></div>';
   h+='<div class="field">';
   ["GK","DEF","MID","FWD"].forEach(function(pos){
     var r=st.filter(function(p){return p.pos===pos});
@@ -3209,10 +3268,14 @@ function tableHTML(){
   var t=D.table||[];
   if(!t.length) return "";
   var played=t.reduce(function(a,r){return a+r.p},0);
+  var prov=(D.allFixtures||[]).filter(function(f){return f.prov}).length;
   return '<h4 class="seclab">Premier League table<i></i></h4>'+
     '<p class="emptynote" style="padding-top:0">Built from '+(played/2)+
     ' completed matches. The FPL API returns zeros for played, won and points, and its '+
-    '"position" field is stale seeding, so this is computed from actual results.</p>'+
+    '"position" field is stale seeding, so this is computed from actual results.'+
+    (prov?' <b>'+prov+' of them finished in the last day or so</b> and FPL has not awarded '+
+     'bonus points yet — the scorelines are final, so they are counted here, but the game '+
+     'itself still lists those fixtures as unfinished.':'')+'</p>'+
     '<div class="tblwrap" style="margin-bottom:20px"><table><thead><tr>'+
     '<th class="num">#</th><th>Club</th><th class="num">P</th><th class="num">W</th>'+
     '<th class="num">D</th><th class="num">L</th><th class="num">GF</th>'+
@@ -3582,22 +3645,22 @@ function getOrdinal(n){
 function explainTransfer(t){
   var i=P(t.inId), o=P(t.outId);
   function line(p,lab){
-    return '<tr><td>'+lab+' '+esc(p.name)+'</td><td class="n">base '+p.base.toFixed(1)+
-      ' × '+p.mult5.toFixed(2)+'/'+D.horizon+'</td><td class="r">'+p.proj5.toFixed(1)+'</td></tr>';
+    return '<tr><td>'+lab+' '+esc(p.name)+'</td><td class="n">'+p.base.toFixed(2)+
+      ' next match · '+p.games5+' fixture'+(p.games5===1?'':'s')+' in the window</td>'+
+      '<td class="r">'+p.proj5.toFixed(1)+'</td></tr>';
   }
   var h='<h5>How this was worked out</h5><table class="calc">'+
     line(i,"In —")+line(o,"Out —")+
     '<tr class="tot"><td>Gain over next 5</td><td class="n"></td><td class="r">'+
     (t.gain5>0?"+":"")+t.gain5.toFixed(1)+'</td></tr></table>'+
-    '<p><b>Base</b> is the model score with the fixture term stripped out — what the player is, '+
-    'independent of who he faces. <b>The multiplier</b> weights each of the next '+D.horizon+
-    ' matches by difficulty (the easiest counts 1.30, an average one 1.00, the hardest '+
-    '0.70), so a blank '+
-    'gameweek adds nothing and a double counts twice. Divided by '+D.horizon+
-    ', an ordinary run of five average fixtures leaves the base untouched.</p>'+
-    '<p><b>This number is an index, not points.</b> It says which move is worth more than '+
-    'which, not how many FPL points you would gain — so do not weigh it directly against '+
-    'the −4 cost of an extra transfer.</p>';
+    '<p>The right-hand column is <b>expected points over the next '+D.horizon+' matches</b>: '+
+    'each fixture priced separately from that club’s attack and defence in that specific game, '+
+    'then added up. A blank gameweek contributes nothing and a double counts twice, which is '+
+    'why the fixture count is shown — it falls out of the arithmetic rather than being '+
+    'corrected for.</p>'+
+    '<p><b>These are points, so you can compare them with a −4 hit directly.</b> Treat the '+
+    'precision with suspicion though: even a properly trained model sits around 5 points of '+
+    'error on the players who actually haul, so a gap of a point or two is noise.</p>';
   return h;
 }
 function xp(v){return (v==null?"—":Number(v).toFixed(2))}
@@ -3670,16 +3733,29 @@ function renderSheet(){
     : '';
 
   var ch=L.chips||{};
+  function spent(key){
+    var r=(mm.chipsUsed||[]).filter(function(c){return c.key===key})[0];
+    if(!r) return '';
+    return '<em class="chipused">'+r.used+' of 2 used'+
+      (r.gws&&r.gws.length?' (GW'+r.gws.join(', GW')+')':'')+
+      (r.left?'':' — none left')+'</em>';
+  }
   var chips='<h4>Chips</h4><div class="chipgrid">'+
     '<div class="chipcard'+(ch.benchBoostWorth?' on':'')+'"><b>Bench Boost</b>'+
     '<span class="cv">'+ch.benchBoost+'</span><small>expected points sitting on your bench'+
     (ch.benchBoostWorth?'. That is a strong bench — worth considering.':
-     '. Below the ~12 points that usually makes this chip worthwhile.')+'</small></div>'+
+     '. Below the ~12 points that usually makes this chip worthwhile.')+'</small>'+
+    spent("bboost")+'</div>'+
     '<div class="chipcard'+(ch.tripleCaptainWorth?' on':'')+'"><b>Triple Captain</b>'+
     '<span class="cv">'+ch.tripleCaptain+'</span><small>expected from '+
     (cap?esc(cap.name):'your captain')+'. The third multiplier adds that much again'+
     (ch.tripleCaptainWorth?' — a genuinely big week.':'. Usually worth holding for a better fixture.')+
-    '</small></div></div>';
+    '</small>'+spent("3xc")+'</div></div>'+
+    ((mm.chipsUsed||[]).length
+      ? '<p class="dim" style="margin-top:8px">Already played: '+
+        mm.chipsUsed.map(function(c){return esc(c.name)+' in GW'+c.gws.join(' and GW')}).join('; ')+
+        '. The 2026-27 game gives two of each, so these are counted against an allowance of two.</p>'
+      : '');
 
   $("#p-sheet").innerHTML=head+verdict+
     '<div class="tsgrid"><div class="card"><h4>Starting eleven · '+L.formation+'</h4>'+
@@ -3803,7 +3879,10 @@ function renderLeague(){
       var sm=D.managers[String(s.entry)];
       return '<tr'+(s.entry===viewEntry?' class="me"':'')+'><td class="num">'+s.rank+'</td>'+
         '<td><button class="mgrbtn" data-entry="'+s.entry+'">'+esc(s.team)+'</button>'+
-        (s.chip?' <span class="pill warn">'+esc(s.chip)+'</span>':'')+'</td><td>'+esc(s.mgr)+
+        (s.chip?' <span class="pill'+(s.chipSpent?'':' warn')+'" title="'+
+          (s.chipSpent?'Played in GW'+s.chipGw+'; that round has finished':'Active this gameweek')+
+          '">'+esc(chipLabel(s.chip))+(s.chipSpent?' · GW'+s.chipGw:'')+'</span>':'')+
+        '</td><td>'+esc(s.mgr)+
         '</td><td class="num">'+s.gw+'</td><td class="num"><b>'+s.total+'</b></td>'+
         '<td class="num">'+(s.total-lead.total===0?"—":(s.total-lead.total))+'</td>'+
         '<td class="num">'+m(s.value/10)+'</td><td class="num">'+m(s.bank/10)+'</td></tr>'+
@@ -4070,6 +4149,19 @@ function renderModel(){
 }
 
 /* ---------------- top strip + orchestration ---------------- */
+function chipLabel(k){
+  return {"3xc":"Triple Captain","bboost":"Bench Boost","freehit":"Free Hit",
+          "wildcard":"Wildcard","manager":"Assistant Manager"}[k]||k;
+}
+function chipCell(mm){
+  // The API reports the chip that was active in the round the picks came from.
+  // Once that round has finished, that is history, not something in force now.
+  if(mm.chip && !mm.chipSpent)
+    return ["Chip",chipLabel(mm.chip),"active in GW"+mm.chipGw,""];
+  if(mm.chip && mm.chipSpent)
+    return ["Last chip",chipLabel(mm.chip),"played in GW"+mm.chipGw+", now finished",""];
+  return ["Chip","None","none played recently",""];
+}
 function renderStrip(){
   var mm=M(), lead=D.standings[0], gap=lead?lead.total-mm.total:null;
   $("#strip").innerHTML=[
@@ -4079,7 +4171,7 @@ function renderStrip(){
     ["Overall rank",mm.overallRank?mm.overallRank.toLocaleString():"—","worldwide",""],
     ["Squad value",m(mm.budget.squadValue),"selling prices",""],
     ["In the bank",m(mm.budget.bank),"spendable now",mm.budget.bank<1?"neg":""],
-    ["Chip",mm.chip?mm.chip:"None",mm.chip?"active this GW":"none active",""]
+    chipCell(mm)
   ].map(function(t){return '<div class="tile"><span class="k">'+esc(t[0])+
     '</span><span class="v '+t[3]+'">'+esc(t[1])+'</span><span class="s">'+esc(t[2])+
     '</span></div>'}).join("");
