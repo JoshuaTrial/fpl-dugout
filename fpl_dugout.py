@@ -704,14 +704,30 @@ def build_fixture_map(fixtures, teams, from_gw, strength, priced=None):
 FORM_WINDOW = 6            # how many recent gameweeks to pull
 
 
-def gw_history(current_gw, window=FORM_WINDOW):
+def gw_history(current_gw, window=FORM_WINDOW, fixtures=None, teams=None):
     """Per-player match logs from the live endpoint, newest gameweek last.
 
-    One request per gameweek rather than one per player, so six calls covers
-    the whole league.
+    One request per gameweek rather than one per player, so six calls covers the
+    whole league. The endpoint carries the full scoring line, not just minutes,
+    so the log records what a player actually did and who he did it against --
+    which is what makes "how did he play last week" an answerable question
+    rather than something to be inferred from a rolling average.
+
+    Note `starts`: the API says outright whether a player was in the eleven.
+    An earlier version inferred it from playing 60 minutes, which quietly
+    mislabels every starter hooked on the hour and every substitute who came on
+    early for an injury.
     """
     hist, got = {}, []
     start = max(1, current_gw - window + 1)
+    opp = {}
+    short = {t["id"]: t["short_name"] for t in (teams or [])}
+    for f in (fixtures or []):
+        ev = f.get("event")
+        if not ev:
+            continue
+        opp[(ev, f["team_h"])] = (short.get(f["team_a"], "?"), "H")
+        opp[(ev, f["team_a"])] = (short.get(f["team_h"], "?"), "A")
     for gw in range(start, current_gw + 1):
         try:
             live = fetch("/event/%d/live/" % gw, ttl=600)
@@ -726,9 +742,25 @@ def gw_history(current_gw, window=FORM_WINDOW):
                 "pts": num(st.get("total_points")),
                 "dc": num(st.get("defensive_contribution")),
                 "xgi": num(st.get("expected_goal_involvements")),
-                "started": mins >= 60,
+                "goals": num(st.get("goals_scored")),
+                "assists": num(st.get("assists")),
+                "cs": num(st.get("clean_sheets")),
+                "gc": num(st.get("goals_conceded")),
+                "saves": num(st.get("saves")),
+                "bonus": num(st.get("bonus")),
+                "bps": num(st.get("bps")),
+                "yc": num(st.get("yellow_cards")),
+                "rc": num(st.get("red_cards")),
+                "og": num(st.get("own_goals")),
+                # the API's own flag where it exists; only fall back to the
+                # 60-minute proxy if the field is genuinely absent, never
+                # because it is present and zero
+                "started": (bool(num(st.get("starts"))) if st.get("starts") is not None
+                            else mins >= 60),
             })
         got.append(gw)
+    # attach who each match was against, once the club is known
+    hist["__opp__"] = opp
     return hist, got
 
 
@@ -1346,6 +1378,66 @@ def window_stats(log, pos):
     }
 
 
+def start_odds(log, prior, status, chance, pos):
+    """How likely is he to be in the eleven, and why.
+
+    Three inputs, in descending order of authority.
+
+    FPL's own availability flag comes first and overrides everything: a
+    suspended or injured player is not starting whatever his record says, and
+    the game publishes a percentage for doubts.
+
+    Then recent starts, weighted toward the newest matches -- a player dropped
+    last week matters more than one dropped in August. Then last season's rate
+    for the many players who have barely featured yet.
+
+    What this CANNOT see is a press conference. A manager saying on Friday that
+    someone is rested for Europe is the single biggest thing that moves a team
+    sheet, and none of it reaches the API until the player is flagged. Treat
+    this as a base rate, not a prediction.
+    """
+    if status == "u":
+        return 0.0, "unavailable"
+    if status == "s":
+        return 0.0, "suspended"
+    if status == "i":
+        return (num(chance) / 100.0 if chance is not None else 0.05), "injured"
+
+    played = [g for g in (log or []) if g.get("mins", 0) > 0 or g.get("started") is not None]
+    recent = (log or [])[-5:]
+    why = None
+    if recent:
+        # newest match counts most; weights 5,4,3,2,1 over the last five
+        wts = list(range(1, len(recent) + 1))
+        p = sum(w * (1.0 if g.get("started") else 0.0) for g, w in zip(recent, wts)) / sum(wts)
+        n_start = sum(1 for g in recent if g.get("started"))
+        conf = min(1.0, len(recent) / 3.0)
+        if prior is not None:
+            p = conf * p + (1 - conf) * prior
+        if n_start == len(recent):
+            why = "started all %d" % len(recent)
+        elif n_start == 0:
+            cameos = sum(1 for g in recent if g.get("mins", 0) > 0)
+            why = ("no starts in %d, %d off the bench" % (len(recent), cameos)
+                   if cameos else "no minutes in %d" % len(recent))
+        else:
+            why = "started %d of the last %d" % (n_start, len(recent))
+    elif prior is not None:
+        p = prior
+        why = "no matches yet; started %d%% of last season" % round(100 * prior)
+    else:
+        p = 0.5
+        why = "no record to go on"
+
+    if status == "d":
+        # a doubt caps it, and the game's own percentage is the better number
+        cap = (num(chance) / 100.0) if chance is not None else 0.5
+        if cap < p:
+            p, why = cap, ("flagged as a doubt" +
+                           (", %d%% chance per FPL" % num(chance) if chance is not None else ""))
+    return max(0.0, min(1.0, p)), why
+
+
 def model_weights(matches_played):
     """How much to trust price versus what has actually happened.
 
@@ -1386,6 +1478,16 @@ def score_players(boot, fixmap, hist, matches_played):
 
         # ---- multi-window history ----
         log = hist.get(e["id"], [])
+        # compact match log, newest last, only for players who have featured
+        opp_map = hist.get("__opp__") or {}
+        e["_log"] = [[g["gw"],
+                      (opp_map.get((g["gw"], e["team"])) or ("?", "-"))[0],
+                      (opp_map.get((g["gw"], e["team"])) or ("?", "-"))[1],
+                      int(g["mins"]), 1 if g.get("started") else 0,
+                      int(g["pts"]), int(g.get("goals") or 0), int(g.get("assists") or 0),
+                      int(g.get("cs") or 0), int(g.get("bonus") or 0),
+                      int(g.get("bps") or 0), int(g.get("dc") or 0)]
+                     for g in log if g["mins"] > 0]
         w = window_stats(log, e["_pos"]) if log else {}
         e["_w"] = w
         e["_form3"] = w.get("form3")
@@ -1419,6 +1521,25 @@ def score_players(boot, fixmap, hist, matches_played):
 
         st = e.get("status", "a")
         chance = e.get("chance_of_playing_next_round")
+
+        # ---- will he actually be in the eleven? ----
+        pri_start = pri_row["st60"] if (pri_row := PRIOR.get(e.get("code"))) else None
+        e["_pStart"], e["_startWhy"] = start_odds(log, pri_start, st, chance, e["_pos"])
+        # minutes follow from that: a starter's typical shift, or a substitute's
+        starter_mins = [g["mins"] for g in log if g.get("started")]
+        sub_mins = [g["mins"] for g in log if not g.get("started") and g.get("mins", 0) > 0]
+        typ_start = (sum(starter_mins) / len(starter_mins)) if starter_mins else 82.0
+        typ_sub = (sum(sub_mins) / len(sub_mins)) if sub_mins else 16.0
+        modelled = e["_pStart"] * typ_start + (1 - e["_pStart"]) * (
+            typ_sub * (0.6 if e["_pStart"] > 0.8 else 1.0))
+        if exp_mins is None:
+            e["_expMins"] = modelled
+        else:
+            # blend the raw recent average with the start-based estimate; they
+            # agree for nailed-on players and disagree exactly where it matters
+            e["_expMins"] = 0.5 * exp_mins + 0.5 * modelled
+        e["_minfac"] = round(0.35 + 0.65 * min(1.0, (e["_expMins"] or 0) / 90.0), 3)
+
         if st == "a":
             av = 1.0
         elif chance is not None:
@@ -1465,13 +1586,11 @@ def score_players(boot, fixmap, hist, matches_played):
         elif e.get("penalties_order") == 2 and e["_r_xg90"] < 0.30:
             e["_r_xg90"] += 0.04
 
-        # minutes: last season's 60-minute rate is a real prior for a new season
-        if e["_expMins"] is None and pri:
-            e["_expMins"] = 90.0 * pri["st60"] * min(1.0, pri["mins"] / 1200.0)
-        elif e["_expMins"] is not None and pri and mins < 400:
-            prior_mins = 90.0 * pri["st60"]
-            wp_ = PRIOR_MINS / (PRIOR_MINS + mins) * min(1.0, pri["mins"] / 900.0)
-            e["_expMins"] = wp_ * prior_mins + (1 - wp_) * e["_expMins"]
+        # Last season's minutes used to be blended in again here. That is now
+        # done inside start_odds, which folds the prior into the probability of
+        # starting rather than into the minutes directly -- doing both meant a
+        # player who had not featured all season still came out at 85 expected
+        # minutes because last season said he was nailed on.
 
     # ---- percentiles within position ----
     for pos in ("GK", "DEF", "MID", "FWD"):
@@ -1611,6 +1730,12 @@ def slim(e, teams):
         "epNext": num(e.get("ep_next")),
         "code": int(num(e.get("code"))),           # -> player mugshot URL
         "teamCode": int(num(t.get("code"))),       # -> club badge URL
+        "pStart": round(e.get("_pStart", 0.5), 2),
+        "startWhy": e.get("_startWhy"),
+        # last matches as fixed-order arrays, which keeps the payload small:
+        # [gw, opponent, H/A, minutes, started, points, goals, assists,
+        #  clean sheet, bonus, bps, defensive actions]
+        "log": e.get("_log") or [],
         "form3": (round(e["_form3"], 2) if e.get("_form3") is not None else None),
         "form5": (round(e["_form5"], 2) if e.get("_form5") is not None else None),
         "formBlend": round(e.get("_formBlend", 0), 2),
@@ -2167,6 +2292,23 @@ CHAT_TOOLS = [
         },
     },
     {
+        "name": "match_history",
+        "description": (
+            "What a player actually did in each of his recent matches: opponent, "
+            "whether he started, minutes, points, goals, assists, clean sheet, "
+            "bonus, BPS and defensive actions. Use this whenever the question is "
+            "about recent performance, a specific game, whether someone is in or "
+            "out of the side, or whether form contradicts the model."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Player surname."},
+                "names": {"type": "array", "items": {"type": "string"},
+                          "description": "Several players at once, to compare."},
+            },
+        },
+    },
+    {
         "name": "find_players",
         "description": (
             "Look up players by name fragment, or list the best available in a "
@@ -2237,6 +2379,41 @@ def tool_find_players(payload, args):
                          for r in runs if r.get("opp")][:5],
         })
     return {"players": rows}
+
+
+def tool_match_history(payload, args):
+    names = list(args.get("names") or [])
+    if args.get("name"):
+        names.append(args["name"])
+    if not names:
+        return {"error": "give at least one player name"}
+    found, missed = _match_players(payload, names)
+    if not found:
+        return {"error": "no player matched %s" % ", ".join(names)}
+    out = []
+    for p in found:
+        rows = []
+        for r in (p.get("log") or []):
+            rows.append({
+                "gw": r[0], "opponent": r[1], "venue": r[2], "minutes": r[3],
+                "started": bool(r[4]), "points": r[5], "goals": r[6],
+                "assists": r[7], "cleanSheet": bool(r[8]), "bonus": r[9],
+                "bps": r[10], "defensiveActions": r[11],
+            })
+        out.append({
+            "name": p["name"], "club": p["club"], "pos": p["pos"],
+            "chanceOfStarting": p.get("pStart"),
+            "startingEvidence": p.get("startWhy"),
+            "availability": p.get("status"),
+            "fplNews": p.get("news") or None,
+            "expectedMinutes": p.get("expMins"),
+            "matches": rows,
+            "note": ("Only gameweeks in which he was on the pitch appear. An empty "
+                     "list means he has not played in the window."),
+        })
+    return {"players": out,
+            "windowGameweeks": (payload["meta"].get("model") or {}).get("formGws"),
+            "notFound": missed or None}
 
 
 def tool_score_transfers(payload, entry, args):
@@ -2333,7 +2510,8 @@ def chat_context(payload, entry):
              % (mm["budget"]["squadValue"], mm["budget"]["bank"]) if mm.get("budget") else "",
              "Free transfers assumed: %s (the public API does not report the real number)."
              % mm.get("freeTransfers", 1),
-             "", "SQUAD (xPts next match / next five / price / sells for):"]
+             "", "SQUAD (xPts next match / next five / price / sells for), then his fixtures and \
+his last four appearances with points scored:"]
     for pk in mm.get("picks", []):
         p = idx.get(pk["id"])
         if not p:
@@ -2343,16 +2521,24 @@ def chat_context(payload, entry):
             tag.append("captain")
         if pk.get("isVice"):
             tag.append("vice")
-        tag.append("starting" if pk.get("starting") else "benched")
-        if p.get("status") and p["status"] != "a":
-            tag.append("FITNESS DOUBT (%s)" % p["status"])
+        tag.append("in the XI" if pk.get("starting") else "benched")
+        tag.append("%d%% to start" % round(100 * (p.get("pStart") or 0)))
+        if p.get("startWhy"):
+            tag.append(p["startWhy"])
+        if p.get("news"):
+            tag.append("FPL NEWS: " + p["news"])
+        elif p.get("status") and p["status"] != "a":
+            tag.append("flagged (%s)" % p["status"])
+        recent = " ".join("%s%s %s%dpt" % (r[1], r[2], "" if r[4] else "sub ", r[5])
+                          for r in (p.get("log") or [])[-4:]) or "no minutes yet"
         runs = ((payload.get("fixtures") or {}).get(p["club"]) or {}).get("runs") or []
         fx = " ".join("%s%s(%s)" % (r.get("opp"), r.get("ha"), r.get("fdr"))
                       for r in runs if r.get("opp"))
-        lines.append("  %-3s %-18s %-4s %5.2f / %5.1f / %4.1fm / %4.1fm  [%s]  %s"
+        lines.append("  %-3s %-18s %-4s %5.2f / %5.1f / %4.1fm / %4.1fm  [%s]"
                      % (p["pos"], p["name"], p["club"], p.get("xp1") or 0,
                         p.get("proj5") or 0, p["price"], pk.get("sell") or 0,
-                        ", ".join(tag), fx))
+                        ", ".join(tag)))
+        lines.append("        fixtures %s | recent %s" % (fx, recent))
 
     if L:
         lines += ["", "WHAT THE MODEL WOULD FIELD THIS WEEK: %s, %s expected points "
@@ -2422,6 +2608,20 @@ For any "what if" -- any combination of transfers the briefing does not already
 price -- call score_transfers. Do not estimate. The tool runs the same arithmetic
 the app runs, including whether the move is even legal. If someone asks about a
 player not in the briefing, call find_players.
+
+You CAN see match-by-match history. If someone says a player did well last week,
+call match_history and check rather than saying you cannot. It returns the
+opponent, whether he started, minutes, points, goals, assists, clean sheet,
+bonus and BPS for each recent appearance. Use it whenever recent form, a
+specific game, or whether someone is in the side comes up.
+
+You also have a chance-of-starting figure for every player, built from recent
+team sheets, last season's start rate and FPL's own availability flag, with the
+evidence behind it. It is a base rate, not inside information: it cannot see a
+press conference, and a manager resting someone for a European tie will not
+appear until FPL flags him. Say so when a decision turns on it. Where FPL has
+published news on a player -- an injury note, a percentage chance -- it is in
+the briefing and it is real, so use it.
 
 Recommend. When the numbers point somewhere, say so plainly rather than laying
 out options and retreating. But the gaps are often inside the error bars, and
@@ -2537,6 +2737,8 @@ def chat_answer(messages, entry, payload):
                 try:
                     if c["name"] == "score_transfers":
                         out = tool_score_transfers(payload, entry, c.get("input") or {})
+                    elif c["name"] == "match_history":
+                        out = tool_match_history(payload, c.get("input") or {})
                     elif c["name"] == "find_players":
                         out = tool_find_players(payload, c.get("input") or {})
                     else:
@@ -2630,7 +2832,7 @@ def build_payload(entry_id, league_id):
     last_done = max([e["id"] for e in events if e.get("finished")] or [0])
     hist, hist_gws = ({}, [])
     if last_done:
-        hist, hist_gws = gw_history(last_done)
+        hist, hist_gws = gw_history(last_done, FORM_WINDOW, fixtures, boot["teams"])
 
     els = score_players(boot, fixmap, hist, matches_played)
     w_prior, w_obs, w_fix = model_weights(matches_played)
@@ -3318,6 +3520,20 @@ main{padding-top:24px}
 .spendcell span{display:block;font-family:"IBM Plex Mono",monospace;font-size:19px;font-weight:700;margin-top:3px}
 .spendbar{height:7px;border-radius:4px;background:var(--sunk);border:1px solid var(--line);overflow:hidden;margin:4px 0 2px}
 .spendbar i{display:block;height:100%;background:var(--accent)}
+.mlog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.mlog h6{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--muted);margin:0 0 6px;font-weight:600}
+table.mltbl{border-collapse:collapse;width:100%;font-size:11.5px}
+table.mltbl th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:8.5px;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:600;
+  padding:0 6px 3px 0;border-bottom:1px solid var(--line)}
+table.mltbl th.num,table.mltbl td.num{text-align:right;padding-right:0}
+table.mltbl td{padding:4px 6px 4px 0;border-bottom:1px solid var(--line)}
+table.mltbl tr.sub td{color:var(--muted)}
+table.mltbl td small{font-family:"IBM Plex Mono",monospace;font-size:8.5px;color:var(--muted);margin-left:2px}
+table.mltbl td em{font-style:normal;font-family:"IBM Plex Mono",monospace;font-size:8.5px;color:var(--warn)}
+.rotrisk{display:inline-block;margin-left:6px;font-family:"IBM Plex Mono",monospace;
+  font-size:8.5px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 4px}
 table.bands{border-collapse:collapse;margin:10px 0 14px;font-size:13px}
 table.bands th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9.5px;
   letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
@@ -3775,12 +3991,30 @@ function fixStrip(short,n){
       '<span class="o">'+esc(r.opp)+'</span><span class="n">Diff '+r.fdr+'</span></div>'
   }).join("")+'</div>';
 }
+function matchLog(p){
+  var L=p.log||[];
+  if(!L.length) return '<div class="mlog"><h6>Recent matches</h6>'+
+    '<p class="dim" style="font-size:11.5px;margin:0">No minutes in the last '+
+    (((D.meta.model||{}).formGws||[]).length||6)+' gameweeks.</p></div>';
+  return '<div class="mlog"><h6>Recent matches</h6><table class="mltbl"><thead><tr>'+
+    '<th>GW</th><th>Opp</th><th class="num">Min</th><th class="num">Pts</th>'+
+    '<th class="num">G</th><th class="num">A</th><th class="num">BPS</th>'+
+    '<th class="num">Def</th></tr></thead><tbody>'+
+    L.slice().reverse().map(function(r){
+      return '<tr'+(r[4]?'':' class="sub"')+'><td>'+r[0]+'</td><td><b>'+esc(r[1])+'</b>'+
+        '<small>'+r[2]+'</small>'+(r[4]?'':'<em title="Came off the bench"> sub</em>')+
+        '</td><td class="num">'+r[3]+'</td><td class="num"><b>'+r[5]+'</b></td>'+
+        '<td class="num">'+(r[6]||"")+'</td><td class="num">'+(r[7]||"")+'</td>'+
+        '<td class="num">'+r[10]+'</td><td class="num">'+r[11]+'</td></tr>';
+    }).join("")+'</tbody></table></div>';
+}
 function statGrid(p){
   var rows=[["Pts",p.pts],["Mins",p.mins],["Starts",p.starts],
     ["Last 3",p.form3==null?"—":p.form3.toFixed(1)],
     ["Last 5",p.form5==null?"—":p.form5.toFixed(1)],
     ["Pts/game",p.ppg.toFixed(1)],
     ["Exp. mins",p.expMins==null?"—":p.expMins],
+    ["Starts XI",p.pStart==null?"—":Math.round(p.pStart*100)+"%"],
     ["Goals",p.goals],["Assists",p.assists],["Bonus",p.bonus],
     ["xG",p.xg.toFixed(2)],["xA",p.xa.toFixed(2)],["xGI/90",p.xgi90.toFixed(2)],
     ["Def. hit rate",p.dcHit==null?"—":Math.round(p.dcHit*100)+"%"],
@@ -3788,12 +4022,17 @@ function statGrid(p){
     ["ICT",p.ict],["BPS",p.bps],["Owned",p.owned+"%"]];
   return '<div class="stats">'+rows.map(function(r){
     return '<div class="st"><span class="k">'+esc(r[0])+'</span><span class="v">'+
-      esc(r[1])+'</span></div>'}).join("")+'</div>';
+      esc(r[1])+'</span></div>'}).join("")+'</div>'+matchLog(p);
 }
 function pillsFor(p){
   var o=[];
   if(p.status!=="a") o.push('<span class="pill '+(p.status==="d"?"warn":"bad")+'">'+
     esc(p.news||"unavailable")+'</span>');
+  if(p.pStart!=null) o.push('<span class="pill'+(p.pStart>=0.85?" good":p.pStart<0.6?" bad":" warn")+
+    '" title="Chance of being in the starting eleven, from recent team sheets, last '+
+    'season\u2019s start rate and FPL\u2019s availability flag. It cannot see press '+
+    'conferences.">'+Math.round(p.pStart*100)+'% to start'+
+    (p.startWhy?' · '+esc(p.startWhy):'')+'</span>');
   if(p.pen===1) o.push('<span class="pill good">Penalties · 1st</span>');
   else if(p.pen===2) o.push('<span class="pill">Penalties · 2nd</span>');
   if(p.ck===1) o.push('<span class="pill">Corners · 1st</span>');
@@ -4441,6 +4680,9 @@ function renderSheet(){
     return '<div class="tsline"><span class="tslab">'+k+'</span>'+pos[k].map(function(p){
       var b=p.id===L.captain?'<span class="badge b-c" title="Captain">C</span>':
             p.id===L.vice?'<span class="badge b-v" title="Vice-captain">V</span>':'';
+      if(p.pStart!=null&&p.pStart<0.7) b+='<span class="rotrisk" title="'+
+        esc((p.startWhy||'')+'. Expected points already allow for this, but it is the '+
+        'kind of call team news should settle.')+'">'+Math.round(p.pStart*100)+'%</span>';
       return '<button class="tscard" data-open="'+p.id+'">'+photoHTML(p)+b+
         '<span class="n">'+esc(p.name)+'</span><span class="x">'+xp(p.xp1)+'</span></button>';
     }).join("")+'</div>';
@@ -5031,11 +5273,25 @@ function renderModel(){
   'assumes the player was bought at the season-start price. Someone bought after a rise will '+
   'really sell for less, so treat any move hinging on the last 0.2m as unconfirmed.</p>'+
 
+  '<h3>Will he actually start?</h3>'+
+  '<p>Every player carries a <b>chance of starting</b>, built from three things in order of '+
+  'authority: FPL’s own availability flag, which overrides everything — a suspended player is '+
+  'not starting whatever his record says; then his recent team sheets, weighted toward the '+
+  'newest matches, because being dropped last week matters more than being dropped in August; '+
+  'then last season’s start rate, for players who have barely featured yet.</p>'+
+  '<p>Expected minutes follow from that rather than from a rolling average, which matters for '+
+  'exactly the players where it is hard to call. Someone who has not featured all season no '+
+  'longer shows 85 expected minutes just because last season says he was nailed on.</p>'+
+  '<p>The API states outright whether a player was in the eleven, so this is his real start '+
+  'record — not inferred from whether he passed 60 minutes, which mislabels every starter '+
+  'hooked on the hour and every substitute brought on early for an injury.</p>'+
+
   '<h3>What it cannot know</h3><ul>'+
-  '<li><b>Team news.</b> The single biggest lever, and it is outside the model — always check '+
-  'the Friday press conferences before the deadline.</li>'+
-  '<li>Rotation for cup and European fixtures.</li>'+
-  '<li>Whether a player is genuinely nailed on, as opposed to currently in the side.</li>'+
+  '<li><b>Press conferences.</b> Still the single biggest lever. A manager saying on Friday '+
+  'that someone is rested for a European tie does not reach the API until the player is '+
+  'flagged, and by then the price has moved. The chance of starting is a base rate, not '+
+  'inside information.</li>'+
+  '<li>Rotation for cup and European fixtures, for the same reason.</li>'+
   '<li>Chip plans beyond what the game reports.</li>'+
   '<li>Anything tactical: a new manager, a formation change, a role change.</li></ul></div>';
 }
