@@ -1965,6 +1965,11 @@ def chips_used(history):
 # computes the answer instead of estimating one.
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "").strip()
+# Identity-linked keys (personal or service-account keys not tied to one
+# workspace) must name the workspace they act in on every request. A key created
+# FOR a workspace does not need this. Left unset, the app tries to learn it from
+# a response header before giving up and telling you where to find it.
+ANTHROPIC_WORKSPACE = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
 # overridable so the whole path can be exercised against a stub in testing
 ANTHROPIC_HOST = os.environ.get("ANTHROPIC_HOST", "https://api.anthropic.com").rstrip("/")
 CHAT_MAX_MONTH = int(os.environ.get("CHAT_MAX_MONTH", "500"))
@@ -1975,7 +1980,8 @@ CHAT_STATE_FILE = os.environ.get("CHAT_STATE_FILE", "/tmp/fpl_dugout_chat.json")
 CHAT_PRICES = {"opus": (5.0, 25.0), "sonnet": (2.0, 10.0), "haiku": (1.0, 5.0)}
 
 _chat = {"month": "", "questions": 0, "in": 0, "out": 0,
-         "cacheRead": 0, "cacheWrite": 0, "model": None, "lastError": None}
+         "cacheRead": 0, "cacheWrite": 0, "model": None, "lastError": None,
+         "workspace": None}
 _payload_cache = {"t": 0.0, "data": None}
 
 
@@ -2035,14 +2041,44 @@ def chat_spend():
     }
 
 
+WORKSPACE_HEADER = "anthropic-workspace-id"
+
+
 def _anthropic(path, body=None, method="POST"):
     url = ANTHROPIC_HOST + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
-        "content-type": "application/json", "accept": "application/json"})
+    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+               "content-type": "application/json", "accept": "application/json"}
+    ws = ANTHROPIC_WORKSPACE or _chat.get("workspace")
+    if ws:
+        headers[WORKSPACE_HEADER] = ws
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=90, context=ssl_context()) as r:
+        # Any successful response names the workspace it ran in, which is the
+        # documented way to discover it. Remember it so an identity-linked key
+        # only has to be told once -- or, with luck, never.
+        seen = r.headers.get(WORKSPACE_HEADER)
+        if seen and not _chat.get("workspace"):
+            _chat["workspace"] = seen
+            _chat_save()
         return json.loads(r.read().decode("utf-8"))
+
+
+def discover_workspace():
+    """Ask a cheap endpoint which workspace this key acts in.
+
+    A successful response carries the workspace in a header even when the
+    request itself needed no workspace, which is the documented way to find it
+    without an admin key.
+    """
+    for path in ("/v1/models?limit=1", "/v1/models"):
+        try:
+            _anthropic(path, None, "GET")
+            if _chat.get("workspace"):
+                return _chat["workspace"]
+        except Exception:                                    # noqa: BLE001
+            continue
+    return None
 
 
 def chat_model():
@@ -2439,7 +2475,8 @@ def chat_answer(messages, entry, payload):
         {"type": "text", "text": chat_context(payload, entry)},
     ]
     used_tools = []
-    for _ in range(5):
+    tried_workspace = [False]
+    for _ in range(6):
         body = {"model": model, "max_tokens": CHAT_MAX_TOKENS,
                 "system": system, "messages": convo, "tools": CHAT_TOOLS}
         try:
@@ -2450,6 +2487,27 @@ def chat_answer(messages, entry, payload):
                 detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
             except Exception:                                # noqa: BLE001
                 pass
+            if WORKSPACE_HEADER in (detail or "") and not tried_workspace[0]:
+                # The key is identity-linked and is not tied to a workspace. If a
+                # response header has already told us which one to use, retry
+                # with it; otherwise say exactly what to set and where to get it.
+                tried_workspace[0] = True
+                if _chat.get("workspace") or ANTHROPIC_WORKSPACE:
+                    continue
+                found = discover_workspace()
+                if found:
+                    _chat["workspace"] = found
+                    _chat_save()
+                    continue
+                msg = ("This API key is identity-linked, so every request has to say "
+                       "which workspace it belongs to. Two ways to fix it: create a new "
+                       "key scoped to a single workspace, which needs no extra setup; or "
+                       "find the ID in the Anthropic Console under Settings then "
+                       "Workspaces, in the ID column (it looks like wrkspc_01ABC...), and "
+                       "set it on Render as ANTHROPIC_WORKSPACE_ID.")
+                _chat["lastError"] = msg
+                _chat_save()
+                return None, {"error": msg}
             msg = {401: "the API key was rejected",
                    429: "rate limited by the API, try again shortly",
                    400: "the request was rejected: " + detail,
@@ -3879,8 +3937,8 @@ function renderSquad(){
   }
   var h='<div class="pitchhead"><h3>'+esc(mm.team)+'</h3><span class="meta">'+
     esc(mm.mgr)+' · '+mm.total+' pts · '+m(mm.budget.squadValue)+' squad · '+
-    m(mm.budget.bank)+' bank'+(mm.chip?' · '+esc(chipLabel(mm.chip))+
-    (mm.chipSpent?' (played GW'+mm.chipGw+')':' active'):'')+'</span></div>';
+    m(mm.budget.bank)+' bank'+(chipActive(mm)?' · '+esc(chipLabel(mm.chip))+
+    ' active':'')+'</span></div>';
   h+='<div class="field">';
   ["GK","DEF","MID","FWD"].forEach(function(pos){
     var r=st.filter(function(p){return p.pos===pos});
@@ -4554,9 +4612,8 @@ function renderLeague(){
       var sm=D.managers[String(s.entry)];
       return '<tr'+(s.entry===viewEntry?' class="me"':'')+'><td class="num">'+s.rank+'</td>'+
         '<td><button class="mgrbtn" data-entry="'+s.entry+'">'+esc(s.team)+'</button>'+
-        (s.chip?' <span class="pill'+(s.chipSpent?'':' warn')+'" title="'+
-          (s.chipSpent?'Played in GW'+s.chipGw+'; that round has finished':'Active this gameweek')+
-          '">'+esc(chipLabel(s.chip))+(s.chipSpent?' · GW'+s.chipGw:'')+'</span>':'')+
+        ((s.chip&&!s.chipSpent)?' <span class="pill warn" title="Playing this chip '+
+          'in the current gameweek">'+esc(chipLabel(s.chip))+'</span>':'')+
         '</td><td>'+esc(s.mgr)+
         '</td><td class="num">'+s.gw+'</td><td class="num"><b>'+s.total+'</b></td>'+
         '<td class="num">'+(s.total-lead.total===0?"—":(s.total-lead.total))+'</td>'+
@@ -4988,14 +5045,17 @@ function chipLabel(k){
   return {"3xc":"Triple Captain","bboost":"Bench Boost","freehit":"Free Hit",
           "wildcard":"Wildcard","manager":"Assistant Manager"}[k]||k;
 }
+function chipActive(mm){
+  // A chip only counts as in force while the round it was played in is still
+  // running. Once that round is over it is history, and history belongs on the
+  // Team Sheet with the rest of the chip record -- not in a header cell that is
+  // meant to say what is true right now.
+  return !!(mm && mm.chip && !mm.chipSpent);
+}
 function chipCell(mm){
-  // The API reports the chip that was active in the round the picks came from.
-  // Once that round has finished, that is history, not something in force now.
-  if(mm.chip && !mm.chipSpent)
-    return ["Chip",chipLabel(mm.chip),"active in GW"+mm.chipGw,""];
-  if(mm.chip && mm.chipSpent)
-    return ["Last chip",chipLabel(mm.chip),"played in GW"+mm.chipGw+", now finished",""];
-  return ["Chip","None","none played recently",""];
+  if(chipActive(mm)) return ["Chip",chipLabel(mm.chip),"active this gameweek",""];
+  var used=(mm.chipsUsed||[]).reduce(function(a,c){return a+c.used},0);
+  return ["Chip","None", used?used+" played so far this season":"none played yet",""];
 }
 function renderStrip(){
   var mm=M(), lead=D.standings[0], gap=lead?lead.total-mm.total:null;
