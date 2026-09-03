@@ -1635,6 +1635,15 @@ def score_players(boot, fixmap, hist, matches_played):
                     "xga": r.get("xga") or LEAGUE_AVG_GOALS}
             per.append(expected_points(e, exp_, r.get("cs") or 0.25))
         e["_xpRuns"] = per
+        # expected points per gameweek rather than per fixture: a double
+        # gameweek adds twice, a blank contributes nothing, and both fall out
+        # of summing by gameweek instead of by position in the list
+        byg, cnt = {}, {}
+        for r, v in zip(runs, per):
+            byg[r["gw"]] = byg.get(r["gw"], 0.0) + v
+            cnt[r["gw"]] = cnt.get(r["gw"], 0) + 1
+        e["_xpGw"] = {g: round(v, 3) for g, v in byg.items()}
+        e["_gwCount"] = cnt
         e["_xp1"] = round(per[0], 2) if per else 0.0
         e["_xp5"] = round(sum(per[:HORIZON]), 1)
         e["_xpAll"] = round(sum(per), 1)
@@ -2033,6 +2042,292 @@ def transfer_bundles(squad_els, pool, bank, sell_price, club_count,
         if len(final) >= limit:
             break
     return final
+
+
+# ---------------------------------------------------------------------------
+# Drafting a squad from scratch
+# ---------------------------------------------------------------------------
+# What the Wildcard question actually is: fifteen players for at most 100.0m --
+# two goalkeepers, five defenders, five midfielders, three forwards, no more
+# than three from any club -- chosen to maximise the ELEVEN that will play, not
+# the fifteen. That distinction is the whole problem. Optimising the fifteen
+# buys four expensive substitutes who never score. Optimising the eleven means
+# buying the cheapest legal bench available and spending the difference on the
+# side, which is exactly what good managers do and what points-per-million
+# reasoning cannot express.
+#
+# Method: seed each formation greedily, then hill-climb by swapping one player
+# at a time, scoring every candidate squad on its best legal eleven. An exact
+# dynamic program over the budget was the first attempt and was abandoned --
+# allocating budget position by position is order-dependent and therefore not
+# actually exact, and the joint program over four position counts and a
+# thousand price points is far too slow for a page load. Local search on the
+# real objective is both faster and closer to right.
+SQUAD_QUOTA = {"GK": 2, "DEF": 5, "MID": 5, "FWD": 3}
+CLUB_LIMIT = 3
+DRAFT_POOL = 26            # strongest candidates per position
+DRAFT_CHEAP = 10           # cheapest per position, for the bench
+DRAFT_PASSES = 6
+
+
+def _draft_pool(els, key):
+    """Who is worth considering: the best, plus the cheapest for bench duty."""
+    pool = {}
+    for pos in ("GK", "DEF", "MID", "FWD"):
+        grp = [e for e in els
+               if e["_pos"] == pos and e.get("_avail", 0) >= 0.75
+               and (e.get("_pStart") or 0) >= 0.4]
+        best = sorted(grp, key=lambda e: -(e.get(key) or 0))[:DRAFT_POOL]
+        cheap = sorted(grp, key=lambda e: (num(e.get("now_cost")),
+                                           -(e.get(key) or 0)))[:DRAFT_CHEAP]
+        seen, merged = set(), []
+        for e in best + cheap:
+            if e["id"] not in seen:
+                seen.add(e["id"])
+                merged.append(e)
+        pool[pos] = merged
+    return pool
+
+
+def _cost(sq):
+    return sum(int(num(e.get("now_cost"))) for e in sq)
+
+
+def _clubs_ok(sq):
+    c = {}
+    for e in sq:
+        c[e["team"]] = c.get(e["team"], 0) + 1
+        if c[e["team"]] > CLUB_LIMIT:
+            return False
+    return True
+
+
+def _xi_of(sq, key):
+    got = pick_eleven([{"id": e["id"], "pos": e["_pos"], "xp1": (e.get(key) or 0.0)}
+                       for e in sq])
+    return got
+
+
+def _seed(pool, shape, budget, key):
+    """A legal starting point: cheapest possible bench, greedy eleven."""
+    d, mi, f = shape
+    start_need = {"GK": 1, "DEF": d, "MID": mi, "FWD": f}
+    bench_need = {p: SQUAD_QUOTA[p] - start_need[p] for p in SQUAD_QUOTA}
+    used, squad = set(), []
+
+    for pos, n in bench_need.items():
+        cheap = sorted(pool[pos], key=lambda e: (num(e.get("now_cost")),
+                                                 -(e.get(key) or 0)))
+        got = []
+        for e in cheap:
+            if len(got) == n:
+                break
+            if e["id"] in used or not _clubs_ok(squad + got + [e]):
+                continue
+            got.append(e)
+        if len(got) < n:
+            return None
+        for e in got:
+            used.add(e["id"])
+        squad += got
+
+    # Starters, best first. Before taking anyone, check that the cheapest
+    # possible fill for every slot still empty -- in this position and every
+    # other -- would still fit. Without that the greedy pass spends everything
+    # on forwards and then cannot afford a legal defence.
+    floor = {p: min([int(num(e.get("now_cost"))) for e in pool[p]] or [40])
+             for p in SQUAD_QUOTA}
+    order = ("GK", "DEF", "MID", "FWD")
+    filled = {p: 0 for p in order}
+    for pos in order:
+        n = start_need[pos]
+        ranked = sorted(pool[pos], key=lambda e: -(e.get(key) or 0))
+        got = []
+        for e in ranked:
+            if len(got) == n:
+                break
+            if e["id"] in used or not _clubs_ok(squad + got + [e]):
+                continue
+            reserve = (n - len(got) - 1) * floor[pos]
+            for p2 in order:
+                if p2 != pos:
+                    reserve += (start_need[p2] - filled[p2]) * floor[p2]
+            if _cost(squad + got + [e]) + reserve > budget:
+                continue
+            got.append(e)
+        if len(got) < n:
+            return None
+        for e in got:
+            used.add(e["id"])
+        squad += got
+        filled[pos] = n
+    return squad if _cost(squad) <= budget else None
+
+
+def _improve(squad, pool, budget, key, passes=DRAFT_PASSES):
+    """Hill-climb: swap one player at a time while the eleven gets better."""
+    cur = list(squad)
+    best_xi = _xi_of(cur, key)
+    best_pts = best_xi["xiPoints"] if best_xi else -1
+    for _ in range(passes):
+        improved = False
+        ids = set(e["id"] for e in cur)
+        for i, out in enumerate(cur):
+            for cand in pool[out["_pos"]]:
+                if cand["id"] in ids:
+                    continue
+                trial = cur[:i] + [cand] + cur[i + 1:]
+                if _cost(trial) > budget or not _clubs_ok(trial):
+                    continue
+                got = _xi_of(trial, key)
+                if got and got["xiPoints"] > best_pts + 1e-9:
+                    cur, best_pts, best_xi = trial, got["xiPoints"], got
+                    ids = set(e["id"] for e in cur)
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return cur, best_xi, best_pts
+
+
+def draft_squad(els, key="_xp5", budget=1000):
+    """The best fifteen under `budget`, judged on the eleven that would play."""
+    pool = _draft_pool(els, key)
+    if any(len(pool[p]) < SQUAD_QUOTA[p] for p in SQUAD_QUOTA):
+        return None
+    best = None
+    for shape in FORMATIONS:
+        seed = _seed(pool, shape, budget, key)
+        if not seed:
+            continue
+        squad, xi, pts = _improve(seed, pool, budget, key)
+        if best is None or pts > best[2]:
+            best = (squad, xi, pts)
+    if not best:
+        return None
+    squad, xi, pts = best
+    by = {e["id"]: e for e in squad}
+    return {
+        "formation": xi["formation"],
+        "xiPoints": round(pts, 1),
+        "withCaptain": round(pts + max((by[i].get(key) or 0) for i in xi["xi"]
+                                       if by[i]["_pos"] != "GK"), 1),
+        "benchPoints": round(sum((by[i].get(key) or 0) for i in
+                                 (xi["bench"] + ([xi["benchGk"]] if xi["benchGk"] else []))), 1),
+        "cost": round(_cost(squad) / 10.0, 1),
+        "spare": round((budget - _cost(squad)) / 10.0, 1),
+        "xi": xi["xi"], "bench": xi["bench"], "benchGk": xi["benchGk"],
+        "captain": xi["captain"], "vice": xi["vice"],
+        "ids": [e["id"] for e in squad],
+    }
+
+
+def gw_benchmarks(els, gws, budget=1000):
+    """The best legal squad money can buy in each of these gameweeks.
+
+    Drafted once and shared by every manager, because the benchmark is the same
+    question for all of them: what would a squad built purely for this week
+    score. Each week is drafted on that week's expected points, so a double
+    gameweek pulls the ideal squad toward the clubs playing twice, and a blank
+    pushes it away from the clubs not playing at all.
+    """
+    out = {}
+    for gw in gws:
+        for e in els:
+            e["_xpTmp"] = (e.get("_xpGw") or {}).get(gw, 0.0)
+        got = draft_squad(els, "_xpTmp", budget)
+        out[gw] = ({"points": round(got["xiPoints"], 1), "ids": got["ids"],
+                    "formation": got["formation"], "cost": got["cost"]}
+                   if got else None)
+    for e in els:
+        e.pop("_xpTmp", None)
+    return out
+
+
+def free_hit_plan(els, squad_ids, benchmarks):
+    """Where a Free Hit is worth most over the coming gameweeks.
+
+    A Free Hit hands you any legal squad for one week and then gives you your
+    own back. Its value in a given week is the gap between the best eleven money
+    can buy that week and the best eleven YOUR fifteen can field. That gap is
+    usually modest -- and then enormous in a blank gameweek, when half a squad
+    has no fixture at all. Which is exactly what the chip is for.
+
+    The test is therefore not "is the gap big" but "is the gap unusually big".
+    A squad that trails by ten points every single week does not have a Free Hit
+    problem; it has a squad problem, and the answer to that is a Wildcard.
+    """
+    by = {e["id"]: e for e in els}
+    mine = [by[i] for i in squad_ids if i in by]
+    rows = []
+    for gw in sorted(benchmarks):
+        bm = benchmarks[gw]
+        counts = lambda e: (e.get("_gwCount") or {}).get(gw, 0)
+        xi = pick_eleven([{"id": e["id"], "pos": e["_pos"],
+                           "xp1": (e.get("_xpGw") or {}).get(gw, 0.0)} for e in mine])
+        mine_pts = round(xi["xiPoints"], 1) if xi else 0.0
+        best_pts = bm["points"] if bm else 0.0
+        rows.append({
+            "gw": gw, "mine": mine_pts, "best": best_pts,
+            "gap": round(best_pts - mine_pts, 1),
+            "blanks": sum(1 for e in mine if counts(e) == 0),
+            "blankNames": [e["id"] for e in mine if counts(e) == 0][:8],
+            "doubles": sum(1 for e in mine if counts(e) > 1),
+            "bestFormation": bm["formation"] if bm else None,
+        })
+    if not rows:
+        return None
+    top = max(rows, key=lambda r: r["gap"])
+    gaps = sorted(r["gap"] for r in rows)
+    median = gaps[len(gaps) // 2]
+    unusual = top["gap"] - median
+    worth = bool(top["gap"] >= 8.0 and unusual >= 5.0)
+    if top["blanks"] >= 4:
+        why = ("gameweek %d leaves %d of your fifteen without a fixture, which is "
+               "exactly what the chip exists for" % (top["gw"], top["blanks"]))
+    elif worth:
+        why = ("gameweek %d is %.1f points worse for your squad than a typical week "
+               "in this run" % (top["gw"], unusual))
+    elif top["gap"] >= 8.0:
+        why = ("your squad trails the best available by about %.1f points every week, "
+               "not just in one of them. A Free Hit only buys back one week, so a "
+               "persistent gap of this size argues for a Wildcard instead" % median)
+    else:
+        why = ("no week in this run stands out -- your squad is within %.1f points of "
+               "the best available throughout, so hold the chip" % top["gap"])
+    return {"weeks": rows, "best": top["gw"], "bestGap": top["gap"],
+            "typicalGap": round(median, 1), "unusual": round(unusual, 1),
+            "worthIt": worth, "reason": why}
+
+
+def squad_vs_best(els, squad_ids, draft):
+    """How my fifteen compares with a freshly drafted one, and where it loses."""
+    if not draft:
+        return None
+    by = {e["id"]: e for e in els}
+    mine = [by[i] for i in squad_ids if i in by]
+    mine_xi = pick_eleven([{"id": e["id"], "pos": e["_pos"], "xp1": e.get("_xp5") or 0.0}
+                           for e in mine])
+    keep = [i for i in squad_ids if i in draft["ids"]]
+    lose = [i for i in squad_ids if i not in draft["ids"]]
+    gain = [i for i in draft["ids"] if i not in squad_ids]
+    per_pos = {}
+    for pos in ("GK", "DEF", "MID", "FWD"):
+        m = sum((by[i].get("_xp5") or 0) for i in squad_ids
+                if i in by and by[i]["_pos"] == pos)
+        b = sum((by[i].get("_xp5") or 0) for i in draft["ids"]
+                if i in by and by[i]["_pos"] == pos)
+        per_pos[pos] = {"mine": round(m, 1), "best": round(b, 1),
+                        "gap": round(b - m, 1)}
+    return {
+        "mineXi": round(mine_xi["xiPoints"], 1) if mine_xi else 0.0,
+        "bestXi": draft["xiPoints"],
+        "gap": round(draft["xiPoints"] - (mine_xi["xiPoints"] if mine_xi else 0), 1),
+        "keep": keep, "lose": lose, "gain": gain,
+        "overlap": len(keep), "byPosition": per_pos,
+    }
 
 
 def replacement_level(els):
@@ -2932,6 +3227,25 @@ def build_payload(entry_id, league_id):
     # loses depth rather than timing the page out.
     search_budget = [float(os.environ.get("FPL_SEARCH_BUDGET", "12.0"))]
 
+    # ---- the best available, drafted from scratch ----
+    # Done once and shared: the benchmark question is identical for everyone.
+    plan_gws = sorted(set(r["gw"] for v in fixmap.values()
+                          for r in v.get("runs", []) if r.get("opp")))[:HORIZON]
+    t0 = time.time()
+    try:
+        dream = draft_squad(els, "_xp5", 1000)
+        benchmarks = gw_benchmarks(els, plan_gws, 1000)
+    except Exception as exc:                                  # noqa: BLE001
+        dream, benchmarks = None, {}
+        sys.stderr.write("draft failed: %s\n" % exc)
+    draft_ms = int((time.time() - t0) * 1000)
+
+    top_by_pos = {}
+    for pos in ("GK", "DEF", "MID", "FWD"):
+        grp = sorted([e for e in els if e["_pos"] == pos and (e.get("_avail") or 0) >= 0.5],
+                     key=lambda e: -(e.get("_xp5") or 0))[:12]
+        top_by_pos[pos] = [e["id"] for e in grp]
+
     managers = {}
     for r in rows:
         entry = r["entry"]
@@ -3054,8 +3368,19 @@ def build_payload(entry_id, league_id):
         except Exception as exc:                              # noqa: BLE001
             bundles = {"error": str(exc)}
 
+        # ---- against the best available, and when to Free Hit ----
+        wildcard = None
+        try:
+            spend_power = int(value + bank)
+            wildcard = draft_squad(els, "_xp5", spend_power) if squad_els else None
+        except Exception:                                     # noqa: BLE001
+            wildcard = None
+        vs_best = squad_vs_best(els, my_ids, wildcard or dream)
+        fh = free_hit_plan(els, my_ids, benchmarks) if benchmarks else None
+
         managers[str(entry)] = {
             "lineup": lineup, "bundles": bundles, "freeTransfers": free,
+            "wildcard": wildcard, "vsBest": vs_best, "freeHit": fh,
             "entry": entry, "team": r["entry_name"], "mgr": r["player_name"],
             "rank": r["rank"], "total": r["total"], "gw": r["event_total"],
             "overallRank": ent.get("summary_overall_rank"),
@@ -3106,6 +3431,8 @@ def build_payload(entry_id, league_id):
                       "priorMins": PRIOR_MINS, "horizon": HORIZON},
             "chat": chat_spend(),
         },
+        "dream": dream, "topByPos": top_by_pos,
+        "benchGws": plan_gws, "draftMs": draft_ms,
         "myEntry": entry_id,
         "league": league,
         "standings": [{"rank": r["rank"], "entry": r["entry"], "team": r["entry_name"],
@@ -3534,6 +3861,44 @@ table.mltbl td small{font-family:"IBM Plex Mono",monospace;font-size:8.5px;color
 table.mltbl td em{font-style:normal;font-family:"IBM Plex Mono",monospace;font-size:8.5px;color:var(--warn)}
 .rotrisk{display:inline-block;margin-left:6px;font-family:"IBM Plex Mono",monospace;
   font-size:8.5px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 4px}
+.topgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:6px}
+.brow{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;
+  border:0;border-bottom:1px solid var(--line);padding:6px 0;cursor:pointer;color:var(--ink)}
+.brow:hover{background:var(--sunk)}
+.bn{flex:1;min-width:0}
+.bn b{display:block;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bn small{display:block;color:var(--muted);font-family:"IBM Plex Mono",monospace;font-size:9px}
+.bx,.bp{font-family:"IBM Plex Mono",monospace;font-size:13px;font-weight:600;text-align:right;width:52px;flex:none}
+.bp{width:46px;color:var(--muted);font-weight:400}
+.bx small,.bp small{display:block;font-size:7.5px;color:var(--muted);font-weight:400}
+.ownmark{color:var(--good);font-weight:700;font-size:11px}
+.ownmark.small{width:14px;flex:none;text-align:right}
+.tscard.owned{border-color:var(--good)}
+.tscard .pr{display:block;font-family:"IBM Plex Mono",monospace;font-size:8.5px;color:var(--muted)}
+.tscard .ownmark{position:absolute;top:2px;left:3px;font-size:10px}
+.benchline{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:9px;
+  padding-top:9px;border-top:1px solid var(--line)}
+.bsub{font-size:11.5px;border:1px solid var(--line);border-radius:6px;padding:3px 7px;background:var(--sunk)}
+.bsub.owned{border-color:var(--good)}
+.bsub em{font-style:normal;font-family:"IBM Plex Mono",monospace;font-size:9px;color:var(--muted)}
+.cmpstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin:10px 0 14px}
+.cmpcell{border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:var(--sunk)}
+.cmpcell.good{border-color:var(--good);background:var(--good-bg)}
+.cmpcell.warn{border-color:var(--warn)}
+.cmpcell.bad{border-color:var(--bad);background:var(--bad-bg)}
+.cmpcell b{display:block;font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--muted);font-weight:600}
+.cmpcell span{display:block;font-family:"IBM Plex Mono",monospace;font-size:22px;font-weight:700;margin:2px 0}
+.cmpcell small{color:var(--muted);font-size:10px;line-height:1.35;display:block}
+table.fhtbl{border-collapse:collapse;width:100%;font-size:12.5px}
+table.fhtbl th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9px;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:600;
+  padding:0 10px 4px 0;border-bottom:1px solid var(--line)}
+table.fhtbl td{padding:6px 10px 6px 0;border-bottom:1px solid var(--line)}
+table.fhtbl tr.hot{background:var(--good-bg)}
+table.fhtbl td.barcell{width:34%;padding-right:0}
+table.fhtbl td.barcell i{display:block;height:6px;border-radius:3px;background:var(--accent)}
+.blank{color:var(--bad);font-family:"IBM Plex Mono",monospace;font-size:10.5px}
 table.bands{border-collapse:collapse;margin:10px 0 14px;font-size:13px}
 table.bands th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9.5px;
   letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
@@ -3827,6 +4192,8 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
         title="Who should start this weekend, who sits, and who takes the armband">Team Sheet</button>
       <button class="tab" role="tab" aria-selected="false" data-p="tx"
         title="Single swaps and multi-transfer bundles, scored on the eleven that would actually play">Transfers</button>
+      <button class="tab" role="tab" aria-selected="false" data-p="best"
+        title="The best players and the best possible squad, and how yours compares">Best XI</button>
       <button class="tab" role="tab" aria-selected="false" data-p="clubs"
         title="League table, all fixtures, and every club's players">Clubs &amp; Fixtures</button>
       <button class="tab" role="tab" aria-selected="false" data-p="players"
@@ -3856,6 +4223,7 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
     </section>
     <section class="panel" id="p-sheet" hidden></section>
     <section class="panel" id="p-tx" hidden></section>
+    <section class="panel" id="p-best" hidden></section>
     <section class="panel" id="p-clubs" hidden></section>
     <section class="panel" id="p-players" hidden></section>
     <section class="panel" id="p-cap" hidden></section>
@@ -3867,7 +4235,7 @@ footer{color:var(--muted);font-size:12.5px;padding:24px 0 34px;border-top:1px so
 <script>
 (function(){
 "use strict";
-var TABS=["home","squad","sheet","tx","clubs","players","cap","league","model"];
+var TABS=["home","squad","sheet","tx","best","clubs","players","cap","league","model"];
 var D=null, byId={}, viewEntry=null, curClub=null, gwView=null,
     sortKey="score", sortDir=-1, openPlayer=null;
 
@@ -5023,6 +5391,140 @@ document.addEventListener("keydown",function(e){
   }
 });
 
+/* ---------------- the best available, and my team against it ---------------- */
+function bestRow(p,extra){
+  return '<button class="brow" data-open="'+p.id+'">'+photoHTML(p)+
+    '<span class="bn"><b>'+esc(p.name)+'</b><small>'+esc(p.club)+' · '+m(p.price)+
+    ' · '+Math.round((p.pStart||0)*100)+'% XI</small></span>'+
+    '<span class="bx">'+Number(p.proj5||0).toFixed(1)+'<small>xPts/'+D.horizon+'</small></span>'+
+    '<span class="bp">'+Number(p.ppm||0).toFixed(2)+'<small>per £m</small></span>'+
+    (extra||'')+'</button>';
+}
+function squadBoard(ids,capId,viceId,mineIds){
+  var pos={GK:[],DEF:[],MID:[],FWD:[]};
+  (ids||[]).forEach(function(i){var p=P(i); if(p&&pos[p.pos]) pos[p.pos].push(p)});
+  var mine=mineIds?{}:null;
+  if(mineIds) mineIds.forEach(function(i){mine[i]=1});
+  return Object.keys(pos).map(function(k){
+    if(!pos[k].length) return "";
+    return '<div class="tsline"><span class="tslab">'+k+'</span>'+pos[k].map(function(p){
+      var b=p.id===capId?'<span class="badge b-c" title="Captain">C</span>':
+            p.id===viceId?'<span class="badge b-v" title="Vice-captain">V</span>':'';
+      var own=mine&&mine[p.id]?'<span class="ownmark" title="Already in your squad">✓</span>':'';
+      return '<button class="tscard'+(own?' owned':'')+'" data-open="'+p.id+'">'+
+        photoHTML(p)+b+own+'<span class="n">'+esc(p.name)+'</span>'+
+        '<span class="x">'+Number(p.proj5||0).toFixed(1)+'</span>'+
+        '<span class="pr">'+m(p.price)+'</span></button>';
+    }).join("")+'</div>';
+  }).join("");
+}
+function renderBest(){
+  var mm=M(), W=mm.wildcard||D.dream, V=mm.vsBest, FH=mm.freeHit;
+  var head=intro('The highest expected points available at every position, the best fifteen '+
+    'that money can buy, and how '+esc(mm.team)+' measures up against it. Everything is '+
+    'expected points over the next '+D.horizon+' matches. Click any player to open him.');
+
+  /* --- top performers --- */
+  var names={GK:"Goalkeepers",DEF:"Defenders",MID:"Midfielders",FWD:"Forwards"};
+  var tops='<h3 class="sechead">Top of each position</h3>'+
+    '<p class="dim">Ranked on expected points, with points per million alongside — useful for '+
+    'spotting the cheap enabler that lets you afford someone at the top of the list, not as a '+
+    'ranking in its own right.</p><div class="topgrid">'+
+    ["GK","DEF","MID","FWD"].map(function(k){
+      var ids=(D.topByPos||{})[k]||[];
+      return '<div class="card"><h4>'+names[k]+'</h4>'+
+        ids.slice(0,8).map(function(i){
+          var p=P(i); if(!p) return '';
+          return bestRow(p,inSquad(i)?'<span class="ownmark small" title="In your squad">✓</span>':'');
+        }).join("")+'</div>';
+    }).join("")+'</div>';
+
+  /* --- the drafted squad --- */
+  var draft='';
+  if(W){
+    draft='<h3 class="sechead">If you wildcarded now</h3>'+
+      '<p class="dim">The best legal fifteen for <b>'+m(mm.budget.total)+'</b> — your squad '+
+      'value plus the bank, which is what a Wildcard gives you. Two goalkeepers, five '+
+      'defenders, five midfielders, three forwards, no more than three from a club. Chosen to '+
+      'maximise <b>the eleven that plays</b>, which is why the bench is deliberately cheap: '+
+      'substitutes score nothing, so every pound on them is a pound not spent on the side.</p>'+
+      '<div class="card"><div class="tsmeta">'+esc(W.formation)+' · costs '+m(W.cost)+
+      ' with '+m(W.spare)+' spare · <b>'+W.xiPoints+'</b> expected points from the eleven, '+
+      W.benchPoints+' sitting on the bench</div>'+
+      squadBoard(W.xi,W.captain,W.vice,mm.picks.map(function(x){return x.id}))+
+      '<div class="benchline"><span class="tslab">SUBS</span>'+
+      (W.bench||[]).concat(W.benchGk?[W.benchGk]:[]).map(function(i){
+        var p=P(i); return p?'<span class="bsub'+(inSquad(i)?' owned':'')+'">'+esc(p.name)+
+          ' <em>'+m(p.price)+'</em></span>':'';}).join("")+'</div></div>';
+  }
+
+  /* --- mine against it --- */
+  var cmp='';
+  if(V){
+    var pn={GK:"Goalkeeper",DEF:"Defence",MID:"Midfield",FWD:"Attack"};
+    var worst=Object.keys(V.byPosition).sort(function(a,b){
+      return V.byPosition[b].gap-V.byPosition[a].gap})[0];
+    cmp='<h3 class="sechead">Your squad against it</h3>'+
+      '<div class="cmpstrip"><div class="cmpcell"><b>Your eleven</b><span>'+V.mineXi+'</span>'+
+      '<small>expected points over '+D.horizon+'</small></div>'+
+      '<div class="cmpcell"><b>Best available</b><span>'+V.bestXi+'</span>'+
+      '<small>same budget, drafted fresh</small></div>'+
+      '<div class="cmpcell'+(V.gap>=20?" bad":V.gap<=8?" good":" warn")+'"><b>Gap</b><span>'+
+      (V.gap>0?"+":"")+V.gap+'</span><small>over '+D.horizon+' matches, so '+
+      (V.gap/D.horizon).toFixed(1)+' a week</small></div>'+
+      '<div class="cmpcell"><b>Players kept</b><span>'+V.overlap+'/15</span>'+
+      '<small>survive the redraft</small></div></div>'+
+      '<p>The gap is widest in <b>'+pn[worst]+'</b>, worth '+V.byPosition[worst].gap+
+      ' points over the run. Position by position:</p>'+
+      '<table class="bands"><tr><th>Position</th><th>Yours</th><th>Best</th><th>Gap</th></tr>'+
+      ["GK","DEF","MID","FWD"].map(function(k){
+        var x=V.byPosition[k];
+        return '<tr><td>'+pn[k]+'</td><td>'+x.mine.toFixed(1)+'</td><td>'+
+          x.best.toFixed(1)+'</td><td><b>'+(x.gap>0?"+":"")+x.gap.toFixed(1)+'</b></td></tr>';
+      }).join("")+'</table>'+
+      (V.lose.length?'<p><b>It would drop:</b> '+V.lose.map(function(i){
+        var p=P(i); return p?esc(p.name)+' <span class="dim">('+Number(p.proj5||0).toFixed(1)+
+          ')</span>':''}).join(", ")+'</p>':'')+
+      (V.keep.length?'<p><b>It would keep:</b> '+V.keep.map(function(i){
+        var p=P(i); return p?esc(p.name):''}).join(", ")+'</p>':'')+
+      '<div class="msg info">A redraft always beats a real squad, because it pays no transfer '+
+      'costs and inherits no past decisions. Treat the gap as a measure of how far you have '+
+      'drifted, not as a plan — and remember a Wildcard is one of two you get per half.</div>'+
+      '<p class="dim">Where this squad leaves out an obvious premium, the margin is usually '+
+      'small. Forcing the most expensive forward back into the side on test cost 2.5 points '+
+      'across five matches — real, but well inside the model’s error. The optimiser is telling '+
+      'you a premium is <i>not clearly worth it</i>, which is different from telling you he is '+
+      'a bad player.</p>';
+  }
+
+  /* --- free hit --- */
+  var fh='';
+  if(FH){
+    var mx=Math.max.apply(null,FH.weeks.map(function(w){return w.best}))||1;
+    fh='<h3 class="sechead">When to play a Free Hit</h3>'+
+      '<p class="dim">A Free Hit gives you any squad for one week, then hands your own back. '+
+      'So it is worth playing where your fifteen falls <b>unusually</b> far behind what money '+
+      'could field — normally a blank gameweek. A gap that is the same every week is not a '+
+      'Free Hit problem.</p>'+
+      '<div class="card"><table class="fhtbl"><thead><tr><th>GW</th><th>Your best XI</th>'+
+      '<th>Best available</th><th>Gap</th><th>Blanks</th><th></th></tr></thead><tbody>'+
+      FH.weeks.map(function(w){
+        var hot=w.gw===FH.best&&FH.worthIt;
+        return '<tr'+(hot?' class="hot"':'')+'><td><b>GW'+w.gw+'</b></td><td>'+w.mine+'</td>'+
+          '<td>'+w.best+'</td><td><b>'+(w.gap>0?"+":"")+w.gap+'</b></td>'+
+          '<td>'+(w.blanks?'<span class="blank">'+w.blanks+' not playing</span>':'—')+'</td>'+
+          '<td class="barcell"><i style="width:'+Math.round(100*w.mine/mx)+'%"></i></td></tr>';
+      }).join("")+'</tbody></table></div>'+
+      '<div class="msg '+(FH.worthIt?"good":"info")+'"><b>'+
+      (FH.worthIt?'Play it in GW'+FH.best:'Hold the chip')+'.</b> '+esc(FH.reason)+'.'+
+      (FH.worthIt?'':' Worst week is GW'+FH.best+' at '+FH.bestGap+
+        ' behind, against '+FH.typicalGap+' in a typical week — only '+FH.unusual+
+        ' of that is specific to the week.')+'</div>';
+  }
+  $("#p-best").innerHTML=head+tops+draft+cmp+fh;
+  wireImgs($("#p-best"));
+}
+
 function renderModel(){
   var w=D.meta.model, mm=M(), b=mm.budget;
   var capped=Object.keys(mm.clubCounts).filter(function(k){return mm.clubCounts[k]>=3});
@@ -5265,6 +5767,28 @@ function renderModel(){
       (c.lastError?' Last error: <b>'+esc(c.lastError)+'</b>.':'')+'</p>';
   })()+
 
+  '<h3>Drafting a squad from scratch</h3>'+
+  '<p>The Best XI page answers the Wildcard question: fifteen players for the money you have, '+
+  'two goalkeepers, five defenders, five midfielders, three forwards, at most three from any '+
+  'club. The objective is the <b>eleven that plays</b>, not the fifteen — and that changes the '+
+  'answer completely. Maximising the fifteen buys four expensive substitutes who score '+
+  'nothing; maximising the eleven buys the cheapest legal bench available and spends the '+
+  'difference on the side, which is what good managers actually do.</p>'+
+  '<p>It is solved by seeding each of the eight legal formations and then hill-climbing — '+
+  'swapping one player at a time, rescoring the best legal eleven each time, until nothing '+
+  'improves. An exact program over the budget was the first attempt and was dropped: '+
+  'allocating money position by position is order-dependent and therefore not exact anyway, '+
+  'and the joint version over four position counts and a thousand price points is far too '+
+  'slow for a page load. Local search on the real objective is both quicker and closer to '+
+  'right, and it runs in well under a tenth of a second.</p>'+
+  '<p><b>Free Hit timing</b> asks a different question. The chip gives you any squad for one '+
+  'week and then returns your own, so its value is the gap between the best eleven money '+
+  'could field that week and the best eleven your fifteen can. Each week is drafted from '+
+  'scratch on that week’s expected points, so a double gameweek pulls the ideal squad toward '+
+  'the clubs playing twice and a blank pushes it away from those not playing. The test is not '+
+  'whether the gap is large but whether it is <b>unusually</b> large: a squad that trails by '+
+  'ten points every week has a squad problem, and the answer to that is a Wildcard.</p>'+
+
   '<h3>Budget — '+esc(mm.team)+'</h3><p>Spending power is <b>'+m(b.total)+'</b> — '+
   m(b.squadValue)+' of squad plus '+m(b.bank)+' banked. A swap is offered only if the incoming '+
   'price fits the outgoing player’s selling price plus the bank, and the three-per-club '+
@@ -5328,7 +5852,7 @@ function renderStrip(){
     '</span></div>'}).join("");
 }
 function renderAll(){
-  renderStrip(); renderHome(); renderSquad(); renderSheet(); renderTx(); renderClubs();
+  renderStrip(); renderHome(); renderSquad(); renderSheet(); renderTx(); renderBest(); renderClubs();
   renderPlayersShell(); renderCap(); renderLeague(); renderModel();
 }
 function bootUI(){
