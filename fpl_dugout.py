@@ -26,7 +26,9 @@ import ssl
 import sys
 import threading
 import time
+import calendar
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1740,6 +1742,10 @@ def slim(e, teams):
         "code": int(num(e.get("code"))),           # -> player mugshot URL
         "teamCode": int(num(t.get("code"))),       # -> club badge URL
         "pStart": round(e.get("_pStart", 0.5), 2),
+        # expected points keyed by gameweek, so a snapshot can record the
+        # forecast for one specific round and a double counts twice
+        "xpGw": e.get("_xpGw") or {},
+        "gwCount": e.get("_gwCount") or {},
         "startWhy": e.get("_startWhy"),
         # last matches as fixed-order arrays, which keeps the payload small:
         # [gw, opponent, H/A, minutes, started, points, goals, assists,
@@ -3083,6 +3089,471 @@ def chat_answer(messages, entry, payload):
 _chat_load()
 
 
+# ---------------------------------------------------------------------------
+# Recording what was predicted, so it can be checked afterwards
+# ---------------------------------------------------------------------------
+# Everything above forecasts. Nothing above has ever been marked. This writes a
+# snapshot of the predictions before each deadline and scores them once the
+# football has been played -- against the actual points, and against the
+# baselines that matter: FPL's own published forecast, and the question of
+# whether the betting odds earn their keep.
+#
+# Storage is a JSON file per gameweek committed to a branch of the repository
+# the app is deployed from. Render's free disk is wiped on every redeploy, which
+# rules it out for anything meant to accumulate across a season; a repository is
+# free, durable, versioned and readable without any tooling. The branch is
+# deliberately NOT the one Render builds from, or each weekly commit would
+# redeploy the app and restart it.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "data").strip()
+SNAPSHOT_KEY = os.environ.get("SNAPSHOT_KEY", "").strip()
+SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", "predictions").strip("/")
+SNAPSHOT_WINDOW_H = float(os.environ.get("SNAPSHOT_WINDOW_H", "24"))
+GH_API = os.environ.get("GITHUB_API", "https://api.github.com").rstrip("/")
+
+_snap_state = {"last": None, "lastGw": None, "error": None, "written": []}
+_acc_cache = {"t": 0.0, "data": None}
+
+
+def storage_on():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+
+def _gh(path, method="GET", body=None):
+    url = "%s/repos/%s/%s" % (GH_API, GITHUB_REPO, path.lstrip("/"))
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + GITHUB_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": UA, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as r:
+        raw = r.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+def gh_read(path):
+    """File contents and its blob sha, or (None, None) if it is not there."""
+    try:
+        got = _gh("contents/%s?ref=%s" % (urllib.parse.quote(path), GITHUB_BRANCH))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        raise
+    if isinstance(got, dict) and got.get("content"):
+        return base64.b64decode(got["content"]), got.get("sha")
+    return None, None
+
+
+def gh_write(path, blob, message):
+    """Create or update a file on the data branch."""
+    _, sha = gh_read(path)
+    body = {"message": message, "branch": GITHUB_BRANCH,
+            "content": base64.b64encode(blob).decode("ascii")}
+    if sha:
+        body["sha"] = sha
+    _gh("contents/%s" % urllib.parse.quote(path), "PUT", body)
+    return True
+
+
+def gh_list_snapshots():
+    try:
+        got = _gh("contents/%s?ref=%s" % (SNAPSHOT_DIR, GITHUB_BRANCH))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return []
+        raise
+    return sorted(f["name"] for f in got if isinstance(f, dict)
+                  and f.get("type") == "file" and f["name"].endswith(".json"))
+
+
+def snapshot_path(gw):
+    return "%s/gw%02d.json" % (SNAPSHOT_DIR, int(gw))
+
+
+# ---- when is it worth taking one -------------------------------------------
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return calendar.timegm(time.strptime(s.replace("Z", "GMT"),
+                                             "%Y-%m-%dT%H:%M:%S%Z"))
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def snapshot_window(events, now=None):
+    """The next deadline, and whether we are inside the recording window.
+
+    The window is the DAY BEFORE the deadline, not the sliver between the
+    deadline and kick-off. Two reasons. That sliver is about ninety minutes
+    long, so catching it needs a cron firing often enough to keep a free-tier
+    instance permanently awake. And a forecast made the day before is the one a
+    manager would actually act on, which makes it the fairer thing to mark.
+    """
+    now = now or time.time()
+    upcoming = sorted(
+        [(_parse_iso(e.get("deadline_time")), e["id"]) for e in events
+         if _parse_iso(e.get("deadline_time"))],
+        key=lambda x: x[0])
+    nxt = next(((t, i) for t, i in upcoming if t > now), None)
+    if not nxt:
+        return {"gw": None, "inWindow": False, "hoursToDeadline": None}
+    dl, gw = nxt
+    hrs = (dl - now) / 3600.0
+    return {"gw": gw, "deadline": dl, "hoursToDeadline": round(hrs, 2),
+            "inWindow": 0 <= hrs <= SNAPSHOT_WINDOW_H}
+
+
+# ---- what a snapshot contains ---------------------------------------------
+# Compact arrays rather than objects: 600 players a week for a season is a lot
+# of repeated key names otherwise. The header says what each column is, so the
+# file stays readable without this source code to hand.
+SNAP_COLUMNS = ["id", "xPts", "fplEpNext", "price", "pStart", "expMins",
+                "difficulty", "fixtureSource", "fixtures"]
+
+
+def build_snapshot(payload, gw, window):
+    fx = payload.get("fixtures") or {}
+    rows = []
+    for p in payload["players"]:
+        runs = [r for r in ((fx.get(p["club"]) or {}).get("runs") or [])
+                if r.get("gw") == gw and r.get("opp")]
+        # expected points for THIS gameweek, summed over its fixtures, so a
+        # double counts twice and a blank records a real zero rather than a gap
+        xp = (p.get("xpGw") or {}).get(str(gw))
+        if xp is None:
+            xp = (p.get("xpGw") or {}).get(gw, 0.0)
+        if runs:
+            diff = min(r.get("fdr") or 3 for r in runs)
+            srcs = "+".join(sorted(set(r.get("src") or "?" for r in runs)))
+        else:
+            diff, srcs = None, "blank"
+        rows.append([p["id"], round(float(xp or 0.0), 3),
+                     p.get("epNext"), p["price"], p.get("pStart"),
+                     p.get("expMins"), diff, srcs, len(runs)])
+    mans = {}
+    for k, mm in (payload.get("managers") or {}).items():
+        L = mm.get("lineup") or {}
+        B = mm.get("bundles") or {}
+        mans[k] = {
+            "team": mm.get("team"),
+            "currentXi": [pk["id"] for pk in mm.get("picks", []) if pk.get("starting")],
+            "currentCaptain": next((pk["id"] for pk in mm.get("picks", [])
+                                    if pk.get("isCap")), None),
+            "advisedXi": L.get("xi"), "advisedCaptain": L.get("captain"),
+            "advisedXiPoints": L.get("xiPoints"),
+            "advisedChanges": L.get("changes"),
+            "singleTransfers": [{"out": t["outId"], "in": t["inId"],
+                                 "gain5": t["gain5"]} for t in (mm.get("transfers") or [])[:5]],
+            "bundles": [{"outs": b["outs"], "ins": b["ins"], "net": b["net"]}
+                        for b in (B.get("2") or [])[:3]],
+        }
+    o = payload.get("odds") or {}
+    return {
+        "gw": gw,
+        "takenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hoursBeforeDeadline": window.get("hoursToDeadline"),
+        "beforeDeadline": bool((window.get("hoursToDeadline") or 0) >= 0),
+        "app": {"priorSeason": PRIOR_SEASON,
+                "matchesPlayed": payload["meta"]["model"].get("matchesPlayed"),
+                "horizon": HORIZON},
+        "odds": {"status": o.get("status"), "priced": o.get("priced")},
+        "columns": SNAP_COLUMNS,
+        "players": rows,
+        "managers": mans,
+    }
+
+
+def take_snapshot(payload, events, force=False):
+    """Record this gameweek's forecast, unless it is already recorded."""
+    if not storage_on():
+        return {"ok": False, "why": "no GITHUB_TOKEN or GITHUB_REPO set"}
+    win = snapshot_window(events)
+    gw = win.get("gw")
+    if not gw:
+        return {"ok": False, "why": "no upcoming deadline"}
+    if not force and not win["inWindow"]:
+        return {"ok": False, "why": "not in the recording window",
+                "hoursToDeadline": win["hoursToDeadline"], "gw": gw}
+    path = snapshot_path(gw)
+    try:
+        existing, _ = gh_read(path)
+        if existing and not force:
+            _snap_state.update(lastGw=gw, error=None)
+            return {"ok": True, "already": True, "gw": gw, "path": path}
+        snap = build_snapshot(payload, gw, win)
+        blob = json.dumps(snap, separators=(",", ":")).encode("utf-8")
+        gh_write(path, blob, "predictions for gameweek %d" % gw)
+        _snap_state.update(last=snap["takenAt"], lastGw=gw, error=None)
+        if gw not in _snap_state["written"]:
+            _snap_state["written"].append(gw)
+        return {"ok": True, "gw": gw, "path": path, "bytes": len(blob),
+                "hoursBeforeDeadline": win["hoursToDeadline"]}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("message", "")
+        except Exception:                                    # noqa: BLE001
+            pass
+        msg = {401: "the GitHub token was rejected",
+               403: "the token lacks Contents write access, or is expired",
+               404: "repo or branch not found -- check GITHUB_REPO and that the "
+                    "'%s' branch exists" % GITHUB_BRANCH,
+               409: "branch conflict, try again"}.get(
+                   e.code, "GitHub returned HTTP %d" % e.code)
+        _snap_state["error"] = "%s. %s" % (msg, detail)
+        return {"ok": False, "why": _snap_state["error"]}
+    except Exception as e:                                   # noqa: BLE001
+        _snap_state["error"] = str(e)
+        return {"ok": False, "why": str(e)}
+
+
+# ---- marking the forecast against what happened ----------------------------
+def _mae(pairs):
+    return sum(abs(a - b) for a, b in pairs) / len(pairs) if pairs else None
+
+
+def _corr(pairs):
+    n = len(pairs)
+    if n < 3:
+        return None
+    mx = sum(a for a, _ in pairs) / n
+    my = sum(b for _, b in pairs) / n
+    vx = sum((a - mx) ** 2 for a, _ in pairs)
+    vy = sum((b - my) ** 2 for _, b in pairs)
+    if vx <= 0 or vy <= 0:
+        return None
+    cov = sum((a - mx) * (b - my) for a, b in pairs)
+    return cov / math.sqrt(vx * vy)
+
+
+def score_gameweek(snap, actual, positions):
+    """One snapshot against one gameweek of real points.
+
+    Only players the model expected to feature are marked. Scoring the whole
+    six hundred would flatter every model equally, because most of them sit at
+    home and score nothing, and predicting a zero for a man who is not playing
+    is not a skill worth measuring.
+    """
+    cols = {c: i for i, c in enumerate(snap.get("columns") or SNAP_COLUMNS)}
+    rows = []
+    for r in snap["players"]:
+        pid = r[cols["id"]]
+        got = actual.get(pid)
+        if got is None:
+            continue
+        mins = got.get("minutes") or 0
+        exp_mins = r[cols["expMins"]] or 0
+        if exp_mins < 20 and mins == 0:
+            continue                       # nobody claimed he would play
+        rows.append({
+            "id": pid, "pos": positions.get(pid, "?"),
+            "pred": float(r[cols["xPts"]] or 0.0),
+            "fpl": float(r[cols["fplEpNext"]] or 0.0),
+            "actual": float(got.get("total_points") or 0),
+            "mins": mins,
+            "src": r[cols["fixtureSource"]],
+            "price": r[cols["price"]],
+            "pStart": r[cols["pStart"]],
+        })
+    if len(rows) < 10:
+        return None
+
+    def block(sel):
+        if len(sel) < 5:
+            return None
+        pm = [(x["pred"], x["actual"]) for x in sel]
+        pf = [(x["fpl"], x["actual"]) for x in sel]
+        return {
+            "n": len(sel),
+            "mae": round(_mae(pm), 3),
+            "corr": round(_corr(pm), 3) if _corr(pm) is not None else None,
+            "bias": round(sum(a - b for a, b in pm) / len(pm), 3),
+            "fplMae": round(_mae(pf), 3),
+            "fplCorr": round(_corr(pf), 3) if _corr(pf) is not None else None,
+            "meanActual": round(sum(x["actual"] for x in sel) / len(sel), 2),
+            "meanPred": round(sum(x["pred"] for x in sel) / len(sel), 2),
+        }
+
+    # calibration: does "6 expected" actually average 6?
+    buckets = []
+    edges = [0, 2, 3, 4, 5, 6, 8, 99]
+    for lo, hi in zip(edges, edges[1:]):
+        sel = [x for x in rows if lo <= x["pred"] < hi]
+        if len(sel) >= 5:
+            buckets.append({"lo": lo, "hi": (None if hi == 99 else hi),
+                            "n": len(sel),
+                            "pred": round(sum(x["pred"] for x in sel) / len(sel), 2),
+                            "actual": round(sum(x["actual"] for x in sel) / len(sel), 2)})
+
+    market = [x for x in rows if "odds" in (x["src"] or "")]
+    model = [x for x in rows if x["src"] == "form"]
+    return {
+        "gw": snap["gw"], "takenAt": snap.get("takenAt"),
+        "hoursBeforeDeadline": snap.get("hoursBeforeDeadline"),
+        "overall": block(rows),
+        "byPosition": {p: block([x for x in rows if x["pos"] == p])
+                       for p in ("GK", "DEF", "MID", "FWD")},
+        "calibration": buckets,
+        "bySource": {"market": block(market), "model": block(model)},
+        "scatter": [[round(x["pred"], 2), x["actual"]] for x in rows],
+        "managers": score_advice(snap, actual),
+    }
+
+
+def score_advice(snap, actual):
+    """Was the advice any good? Captaincy and transfers, marked on that week."""
+    pts = lambda i: float((actual.get(i) or {}).get("total_points") or 0)
+    out = {}
+    for k, mm in (snap.get("managers") or {}).items():
+        cap_a, cap_c = mm.get("advisedCaptain"), mm.get("currentCaptain")
+        row = {"team": mm.get("team")}
+        if cap_a and cap_c:
+            row["captain"] = {
+                "advised": cap_a, "actual": cap_c,
+                "advisedPoints": pts(cap_a), "yourPoints": pts(cap_c),
+                # the armband doubles, so the difference counts twice
+                "swing": round(pts(cap_a) - pts(cap_c), 1),
+                "agreed": cap_a == cap_c,
+            }
+        moves = []
+        for t in (mm.get("singleTransfers") or [])[:5]:
+            moves.append({"out": t["out"], "in": t["in"],
+                          "outPoints": pts(t["out"]), "inPoints": pts(t["in"]),
+                          "gained": round(pts(t["in"]) - pts(t["out"]), 1)})
+        if moves:
+            row["transfers"] = moves
+            row["transferHitRate"] = round(
+                sum(1 for x in moves if x["gained"] > 0) / float(len(moves)), 2)
+        xi_a, xi_c = mm.get("advisedXi"), mm.get("currentXi")
+        if xi_a and xi_c:
+            row["lineup"] = {
+                "advisedPoints": round(sum(pts(i) for i in xi_a), 1),
+                "yourPoints": round(sum(pts(i) for i in xi_c), 1),
+                "swing": round(sum(pts(i) for i in xi_a) - sum(pts(i) for i in xi_c), 1),
+            }
+        out[k] = row
+    return out
+
+
+def accuracy_report(boot, max_gws=12):
+    """Every snapshot that now has real points behind it, marked and combined."""
+    if not storage_on():
+        return {"on": False, "why": "no repository configured"}
+    now = time.time()
+    with _lock:
+        if _acc_cache["data"] and now - _acc_cache["t"] < 1800:
+            return _acc_cache["data"]
+    positions = {e["id"]: POS.get(e["element_type"], "MID") for e in boot["elements"]}
+    finished = set(e["id"] for e in boot["events"] if e.get("finished"))
+    try:
+        names = gh_list_snapshots()
+    except Exception as e:                                   # noqa: BLE001
+        return {"on": True, "why": "could not list snapshots (%s)" % e, "weeks": []}
+    weeks, skipped = [], []
+    for nm in names[-max_gws:]:
+        try:
+            gw = int(nm.replace("gw", "").replace(".json", ""))
+        except ValueError:
+            continue
+        if gw not in finished:
+            skipped.append(gw)
+            continue
+        try:
+            blob, _ = gh_read("%s/%s" % (SNAPSHOT_DIR, nm))
+            if not blob:
+                continue
+            snap = json.loads(blob.decode("utf-8"))
+            live = fetch("/event/%d/live/" % gw, ttl=3600)
+            actual = {el["id"]: (el.get("stats") or {}) for el in live.get("elements", [])}
+            got = score_gameweek(snap, actual, positions)
+            if got:
+                weeks.append(got)
+        except Exception as e:                               # noqa: BLE001
+            skipped.append("%s (%s)" % (gw, e))
+    out = {"on": True, "weeks": weeks, "pending": skipped,
+           "snapshots": len(names), "branch": GITHUB_BRANCH, "repo": GITHUB_REPO}
+    if weeks:
+        allrows = [pt for w in weeks for pt in w["scatter"]]
+        n = sum(w["overall"]["n"] for w in weeks if w.get("overall"))
+        wmae = sum(w["overall"]["mae"] * w["overall"]["n"]
+                   for w in weeks if w.get("overall")) / max(1, n)
+        fmae = sum(w["overall"]["fplMae"] * w["overall"]["n"]
+                   for w in weeks if w.get("overall")) / max(1, n)
+        out["combined"] = {
+            "n": n, "gameweeks": [w["gw"] for w in weeks],
+            "mae": round(wmae, 3), "fplMae": round(fmae, 3),
+            "beatsFpl": bool(wmae < fmae),
+            "edge": round(fmae - wmae, 3),
+            "corr": round(_corr([(a, b) for a, b in allrows]), 3)
+            if len(allrows) > 3 else None,
+            "scatter": allrows[:1200],
+        }
+    with _lock:
+        _acc_cache.update(t=now, data=out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Telling the app what it cannot see
+# ---------------------------------------------------------------------------
+# Between one round finishing and the next deadline passing, the public API
+# returns no team for the coming gameweek -- /entry/{id}/event/{gw}/picks/ is a
+# 404 until the deadline is gone. So a captain changed on Thursday is invisible
+# until Saturday. The only endpoint that exposes an unlocked team needs the
+# manager's own login, which is not a thing to build around.
+#
+# Instead the manager can say. The override applies ONLY while the game has
+# nothing real to offer, and is dropped the moment it does, so it cannot go
+# stale and start contradicting the truth.
+OVERRIDE_FILE = os.environ.get("FPL_OVERRIDE_FILE", "/tmp/fpl_dugout_override.json")
+_overrides = {}
+
+
+def _ov_load():
+    global _overrides
+    try:
+        with open(OVERRIDE_FILE) as fh:
+            got = json.load(fh)
+        if isinstance(got, dict):
+            _overrides = got
+    except Exception:                                        # noqa: BLE001
+        _overrides = {}
+
+
+def _ov_save():
+    try:
+        with open(OVERRIDE_FILE, "w") as fh:
+            json.dump(_overrides, fh)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def apply_override(entry, gw, picks_gw_done, cap, vice, chip):
+    """Return (captain, vice, chip, note) after any manual override."""
+    key = str(entry)
+    o = _overrides.get(key)
+    if not o:
+        return cap, vice, chip, None
+    if int(o.get("gw") or 0) != int(gw or 0) + (1 if picks_gw_done else 0):
+        return cap, vice, chip, None
+    if not picks_gw_done:
+        # the game now has a real selection, so the override has served its
+        # purpose and is discarded rather than left to rot
+        _overrides.pop(key, None)
+        _ov_save()
+        return cap, vice, chip, None
+    return (o.get("captain") or cap, o.get("vice") or vice,
+            o.get("chip") or chip,
+            "set by hand for gameweek %s, because the game has not published a "
+            "team for it yet" % o.get("gw"))
+
+
+_ov_load()
+
+
 def season_of(events):
     """Which season these fixtures belong to, as FPL labels it (e.g. 2026-27).
 
@@ -3286,6 +3757,9 @@ def build_payload(entry_id, league_id):
 
         cap = next((p["element"] for p in (rp["picks"] if rp else []) if p.get("is_captain")), None)
         vice = next((p["element"] for p in (rp["picks"] if rp else []) if p.get("is_vice_captain")), None)
+        chip_now = (rp or {}).get("active_chip")
+        cap, vice, chip_now, ov_note = apply_override(
+            entry, gw, picks_gw_done, cap, vice, chip_now)
 
         picks_out = []
         for pk in (rp["picks"] if rp else []):
@@ -3407,8 +3881,10 @@ def build_payload(entry_id, league_id):
             "entry": entry, "team": r["entry_name"], "mgr": r["player_name"],
             "rank": r["rank"], "total": r["total"], "gw": r["event_total"],
             "overallRank": ent.get("summary_overall_rank"),
-            "value": value, "bank": bank, "chip": (rp or {}).get("active_chip"),
+            "value": value, "bank": bank, "chip": chip_now,
             "chipGw": gw, "chipSpent": picks_gw_done,
+            "override": ov_note, "canOverride": bool(picks_gw_done),
+            "overrideGw": (gw + 1) if picks_gw_done else gw,
             "chipsUsed": chips_used(hist_by_entry.get(entry)),
             "budget": {"squadValue": round(value / 10, 1), "bank": round(bank / 10, 1),
                        "total": round((value + bank) / 10, 1)},
@@ -3453,6 +3929,10 @@ def build_payload(entry_id, league_id):
                       "priorCoverage": sum(1 for e in els if e.get("_hasPrior")),
                       "priorMins": PRIOR_MINS, "horizon": HORIZON},
             "chat": chat_spend(),
+            "snapshot": dict(snapshot_window(events),
+                             on=storage_on(), repo=GITHUB_REPO,
+                             branch=GITHUB_BRANCH, lastGw=_snap_state["lastGw"],
+                             last=_snap_state["last"], error=_snap_state["error"]),
         },
         "dream": dream, "topByPos": top_by_pos,
         "benchGws": plan_gws, "draftMs": draft_ms,
@@ -3554,6 +4034,14 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     _payload_cache["t"] = time.time()
                     _payload_cache["data"] = data
+                # If this request happens to land in the day before a deadline
+                # and nothing has been recorded yet, record it now. The cron is
+                # the reliable path; this is the one that costs nothing.
+                try:
+                    if storage_on() and (data["meta"]["snapshot"] or {}).get("inWindow"):
+                        take_snapshot(data, self._events())
+                except Exception:                             # noqa: BLE001
+                    pass
                 return self._send(200, json.dumps(data), "application/json")
             except FPLError as e:
                 return self._send(200, json.dumps({"error": str(e)}), "application/json")
@@ -3562,12 +4050,39 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "%s: %s" % (type(e).__name__, e)}), "application/json")
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
+        if path == "/api/snapshot":
+            # guarded by its own key, so the URL can be handed to a cron
+            # service without also handing over the site password
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if not SNAPSHOT_KEY or (q.get("key") or [""])[0] != SNAPSHOT_KEY:
+                return self._send(403, json.dumps(
+                    {"error": "bad or missing key"}), "application/json")
+            try:
+                data = self._payload()
+                got = take_snapshot(data, self._events(),
+                                    force=(q.get("force") or [""])[0] == "1")
+                return self._send(200, json.dumps(got), "application/json")
+            except Exception as e:                            # noqa: BLE001
+                return self._send(200, json.dumps(
+                    {"ok": False, "why": "%s: %s" % (type(e).__name__, e)}),
+                    "application/json")
+        if path == "/api/accuracy":
+            try:
+                return self._send(200, json.dumps(
+                    accuracy_report(fetch("/bootstrap-static/"))), "application/json")
+            except Exception as e:                            # noqa: BLE001
+                return self._send(200, json.dumps(
+                    {"on": True, "why": "%s: %s" % (type(e).__name__, e),
+                     "weeks": []}), "application/json")
         if path == "/api/refresh":
             with _lock:
                 _cache.clear()
                 _payload_cache["t"] = 0.0
             return self._send(200, json.dumps({"ok": True}), "application/json")
         self._send(404, "not found", "text/plain; charset=utf-8")
+
+    def _events(self):
+        return fetch("/bootstrap-static/").get("events", [])
 
     def _payload(self):
         """The chat reuses whatever the interface last rendered rather than
@@ -3588,6 +4103,28 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if not self._authed():
             return
+        if path == "/api/override":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception as e:                            # noqa: BLE001
+                return self._send(200, json.dumps(
+                    {"error": "bad request (%s)" % e}), "application/json")
+            key = str(req.get("entry") or "")
+            if not key:
+                return self._send(200, json.dumps({"error": "no entry"}),
+                                  "application/json")
+            if req.get("clear"):
+                _overrides.pop(key, None)
+            else:
+                _overrides[key] = {"gw": req.get("gw"),
+                                   "captain": req.get("captain"),
+                                   "vice": req.get("vice"),
+                                   "chip": req.get("chip")}
+            _ov_save()
+            with _lock:
+                _payload_cache["t"] = 0.0
+            return self._send(200, json.dumps({"ok": True}), "application/json")
         if path != "/api/chat":
             return self._send(404, "not found", "text/plain; charset=utf-8")
         try:
@@ -3626,6 +4163,7 @@ PAGE = r"""<!doctype html>
   --paper:#EFF1F4; --card:#FFFFFF; --sunk:#E4E8ED; --line:#D3D9E1;
   --ink:#0F1319; --ink2:#39424F; --muted:#5C6675;
   --accent:#2F5FD0; --accent-soft:#E2E9FA;
+  --c1:#2F5FD0; --c2:#A8741C;   /* chart hues, validated for this surface */
   --good:#1F8A5B; --warn:#C98A16; --bad:#C4453C;
   --good-bg:#DFF0E7; --warn-bg:#F8EDD5; --bad-bg:#F7E0DE;
   --pitch:#1B5340; --pitch2:#1F604A; --chalk:rgba(255,255,255,.24);
@@ -3635,6 +4173,7 @@ PAGE = r"""<!doctype html>
   --paper:#10141A; --card:#171D26; --sunk:#1E2530; --line:#2A3340;
   --ink:#E8ECF2; --ink2:#B9C3D0; --muted:#8B97A8;
   --accent:#5B8DEF; --accent-soft:#1C2942;
+  --c1:#5B8DEF; --c2:#B98428;   /* chart hues, validated for the dark surface */
   --good:#3FB27F; --warn:#E0A93A; --bad:#E0685E;
   --good-bg:#12312580; --warn-bg:#33280C80; --bad-bg:#3A1D1B80;
   --pitch:#123B2E; --pitch2:#164837; --chalk:rgba(255,255,255,.18);
@@ -3644,6 +4183,7 @@ PAGE = r"""<!doctype html>
   --paper:#10141A; --card:#171D26; --sunk:#1E2530; --line:#2A3340;
   --ink:#E8ECF2; --ink2:#B9C3D0; --muted:#8B97A8;
   --accent:#5B8DEF; --accent-soft:#1C2942;
+  --c1:#5B8DEF; --c2:#B98428;   /* chart hues, validated for the dark surface */
   --good:#3FB27F; --warn:#E0A93A; --bad:#E0685E;
   --good-bg:#12312580; --warn-bg:#33280C80; --bad-bg:#3A1D1B80;
   --pitch:#123B2E; --pitch2:#164837; --chalk:rgba(255,255,255,.18);
@@ -3922,6 +4462,27 @@ table.fhtbl tr.hot{background:var(--good-bg)}
 table.fhtbl td.barcell{width:34%;padding-right:0}
 table.fhtbl td.barcell i{display:block;height:6px;border-radius:3px;background:var(--accent)}
 .blank{color:var(--bad);font-family:"IBM Plex Mono",monospace;font-size:10.5px}
+svg.chart{width:100%;max-width:620px;height:auto;display:block;margin:10px 0 14px}
+svg.chart .gl{stroke:var(--line);stroke-width:1}
+svg.chart .ax{fill:var(--muted);font-family:"IBM Plex Mono",monospace;font-size:9px}
+svg.chart .ax.mid{text-anchor:middle} svg.chart .ax.end{text-anchor:end}
+svg.chart .ax.ttl{font-size:9.5px;letter-spacing:.05em;text-transform:uppercase}
+svg.chart .dot{fill:var(--muted);opacity:.28}
+svg.chart .ref{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:4 3;opacity:.55}
+svg.chart .refl{fill:var(--ink2)}
+svg.chart .cal{fill:none;stroke:var(--c1);stroke-width:2.5;stroke-linejoin:round}
+svg.chart .calm{fill:var(--c1);stroke:var(--card);stroke-width:2}
+svg.chart .callbl{fill:var(--c1);text-anchor:start;font-weight:600}
+.winA{color:var(--c1);font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600}
+.winB{color:var(--c2);font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600}
+.bad{color:var(--bad)}
+.ovbox{border:1px solid var(--warn);background:var(--card);border-radius:9px;padding:11px 12px;margin-bottom:12px}
+.ovbox h5{margin:0 0 4px;font-size:13px}
+.ovrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px}
+.ovrow label{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--muted)}
+.ovrow select{font:inherit;font-size:12.5px;padding:5px 7px;border-radius:7px;
+  border:1px solid var(--line);background:var(--bg);color:var(--ink)}
 table.bands{border-collapse:collapse;margin:10px 0 14px;font-size:13px}
 table.bands th{text-align:left;font-family:"IBM Plex Mono",monospace;font-size:9.5px;
   letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
@@ -5033,9 +5594,58 @@ function miniRow(p,extra,tag){
     m(p.price)+'</small></div><div class="tsx">'+xp(p.xp1)+'<small>xPts</small></div>'+
     (extra||'')+'</div>';
 }
+function overrideHTML(mm){
+  if(!mm.canOverride) return '';
+  var sq=squadOf(), gw=mm.overrideGw;
+  var curCapPick=(mm.picks||[]).filter(function(p){return p.isCap})[0];
+  var curVicePick=(mm.picks||[]).filter(function(p){return p.isVice})[0];
+  var curCap=curCapPick?curCapPick.id:null, curVice=curVicePick?curVicePick.id:null;
+  var opt=function(sel){
+    return sq.filter(function(p){return p.pos!=="GK"}).map(function(p){
+      return '<option value="'+p.id+'"'+(p.id===sel?' selected':'')+'>'+esc(p.name)+
+        '</option>'}).join("");
+  };
+  var carried=curCap&&P(curCap)?esc(P(curCap).name):"nobody";
+  return '<div class="ovbox"><h5>FPL has not published your gameweek '+gw+' team yet</h5>'+
+    '<p class="dim" style="margin:0;font-size:12px">The game returns no team for a gameweek '+
+    'until its deadline has passed, so a captain you changed today is invisible to this app '+
+    'until the round starts. It is assuming <b>'+carried+'</b> carries over from gameweek '+
+    mm.chipGw+'. Correct it here if you have already changed it — the override is dropped '+
+    'automatically once real data arrives, so it cannot go stale.'+
+    (mm.override?' <b>Currently overridden ('+esc(mm.override)+').</b>':'')+'</p>'+
+    '<div class="ovrow"><label>Captain</label><select id="ovcap">'+opt(curCap)+'</select>'+
+    '<label>Vice</label><select id="ovvice">'+opt(curVice)+'</select>'+
+    '<label>Chip</label><select id="ovchip">'+
+      ['','3xc','bboost','freehit','wildcard'].map(function(c){
+        return '<option value="'+c+'"'+((mm.chip||"")===c?' selected':'')+'>'+
+          (c?chipLabel(c):'None')+'</option>'}).join("")+'</select>'+
+    '<button class="btn" id="ovsave" type="button" data-gw="'+gw+'">Save</button>'+
+    (mm.override?'<button class="btn ghost" id="ovclear" type="button">Clear</button>':'')+
+    '</div></div>';
+}
+document.addEventListener("click",function(e){
+  if(e.target.id==="ovsave"){
+    var body={entry:viewEntry,gw:Number(e.target.getAttribute("data-gw")),
+      captain:Number($("#ovcap").value),vice:Number($("#ovvice").value),
+      chip:$("#ovchip").value||null};
+    e.target.disabled=true; e.target.textContent="Saving…";
+    fetch("/api/override",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify(body)}).then(function(){location.reload()});
+  }
+  if(e.target.id==="ovclear"){
+    fetch("/api/override",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({entry:viewEntry,clear:true})}).then(function(){location.reload()});
+  }
+});
 function renderSheet(){
   var mm=M(), L=mm.lineup;
-  if(!L){ $("#p-sheet").innerHTML=intro('No squad available for this manager yet.'); return; }
+  if(!L){
+    // No team sheet to build, but the override must still be reachable -- this
+    // is precisely the case where the game has told us nothing.
+    $("#p-sheet").innerHTML=intro('The game has not returned a squad for this manager yet.')+
+      overrideHTML(mm);
+    return;
+  }
   var mk=L.marketBacked||0;
   var head=intro('The best eleven the model can build out of '+esc(mm.team)+'’s fifteen, '+
     'for <b>this gameweek only</b>. Every number here is expected points for the next match — '+
@@ -5123,7 +5733,7 @@ function renderSheet(){
         '. The 2026-27 game gives two of each, so these are counted against an allowance of two.</p>'
       : '');
 
-  $("#p-sheet").innerHTML=head+verdict+
+  $("#p-sheet").innerHTML=head+overrideHTML(mm)+verdict+
     '<div class="tsgrid"><div class="card"><h4>Starting eleven · '+L.formation+'</h4>'+
     '<div class="tsmeta">'+L.xiPoints+' expected points, <b>'+L.withCaptain+
     '</b> with the captain doubled</div>'+pitch+
@@ -5548,6 +6158,145 @@ function renderBest(){
   wireImgs($("#p-best"));
 }
 
+/* ---------------- was any of it right? ---------------- */
+var ACC=null, ACC_LOADING=false;
+function loadAccuracy(){
+  if(ACC||ACC_LOADING) return;
+  ACC_LOADING=true;
+  fetch("/api/accuracy",{cache:"no-store"}).then(function(r){return r.json()})
+    .then(function(d){ACC=d; ACC_LOADING=false; renderModel();})
+    .catch(function(e){ACC={on:true,why:String(e),weeks:[]}; ACC_LOADING=false; renderModel();});
+}
+function scatterSVG(pts,buckets){
+  var W=560,H=300,L=42,B=32,T=12,R=12;
+  var mx=Math.max(12,Math.ceil(Math.max.apply(null,pts.map(function(p){return Math.max(p[0],p[1])}))/2)*2);
+  var X=function(v){return L+(W-L-R)*v/mx}, Y=function(v){return H-B-(H-B-T)*v/mx};
+  var ticks=[];for(var t=0;t<=mx;t+=Math.max(2,Math.round(mx/6/2)*2))ticks.push(t);
+  var g=ticks.map(function(t){
+    return '<line x1="'+X(t)+'" y1="'+T+'" x2="'+X(t)+'" y2="'+(H-B)+'" class="gl"/>'+
+           '<line x1="'+L+'" y1="'+Y(t)+'" x2="'+(W-R)+'" y2="'+Y(t)+'" class="gl"/>'+
+           '<text x="'+X(t)+'" y="'+(H-B+13)+'" class="ax mid">'+t+'</text>'+
+           '<text x="'+(L-6)+'" y="'+(Y(t)+3)+'" class="ax end">'+t+'</text>';
+  }).join("");
+  var dots=pts.map(function(p){
+    return '<circle cx="'+X(p[0]).toFixed(1)+'" cy="'+Y(p[1]).toFixed(1)+'" r="2.4" class="dot"/>';
+  }).join("");
+  var cal=(buckets||[]).filter(function(b){return b.pred<=mx});
+  var line=cal.length>1?'<polyline class="cal" points="'+cal.map(function(b){
+    return X(b.pred).toFixed(1)+','+Y(b.actual).toFixed(1)}).join(" ")+'"/>':'';
+  var marks=cal.map(function(b){
+    return '<circle cx="'+X(b.pred).toFixed(1)+'" cy="'+Y(b.actual).toFixed(1)+'" r="4.5" class="calm">'+
+      '<title>'+b.n+' players predicted about '+b.pred.toFixed(1)+' actually averaged '+
+      b.actual.toFixed(1)+'</title></circle>';
+  }).join("");
+  var last=cal.length?cal[cal.length-1]:null;
+  return '<svg viewBox="0 0 '+W+' '+H+'" class="chart" role="img" '+
+    'aria-label="Predicted expected points against points actually scored">'+g+
+    '<line x1="'+X(0)+'" y1="'+Y(0)+'" x2="'+X(mx)+'" y2="'+Y(mx)+'" class="ref"/>'+
+    '<text x="'+(X(mx)-4)+'" y="'+(Y(mx)+14)+'" class="ax end refl">perfect</text>'+
+    dots+line+marks+
+    (last?'<text x="'+(X(last.pred)+8)+'" y="'+(Y(last.actual)-7)+'" class="ax callbl">average actual</text>':'')+
+    '<text x="'+((W-L)/2+L)+'" y="'+(H-4)+'" class="ax mid ttl">predicted</text>'+
+    '<text transform="translate(11,'+((H-B)/2)+') rotate(-90)" class="ax mid ttl">actually scored</text>'+
+    '</svg>';
+}
+function accuracyHTML(){
+  var A=ACC;
+  if(!A) { loadAccuracy();
+    return '<h3>Was any of it right?</h3><p class="dim">Loading the record…</p>'; }
+  if(!A.on) return '<h3>Was any of it right?</h3><p>Nothing is being recorded: no '+
+    '<code>GITHUB_REPO</code> or <code>GITHUB_TOKEN</code> is set, so predictions are made '+
+    'and then forgotten.</p>';
+  var snap=(D.meta&&D.meta.snapshot)||{};
+  var status='<p class="dim">Writing to <code>'+esc(A.repo||"")+'</code> on branch <code>'+
+    esc(A.branch||"")+'</code> · '+(A.snapshots||0)+' gameweek'+((A.snapshots===1)?'':'s')+
+    ' recorded'+(snap.hoursToDeadline!=null?' · next deadline in '+
+      Math.round(snap.hoursToDeadline)+'h'+(snap.inWindow?', inside the recording window':''):'')+
+    (snap.error?' · <b class="bad">'+esc(snap.error)+'</b>':'')+'</p>';
+  if(!A.weeks||!A.weeks.length){
+    return '<h3>Was any of it right?</h3>'+
+      '<p>Every forecast is written to a file before the deadline and marked once the '+
+      'football has been played — against what actually happened, and against '+
+      '<b>FPL’s own published forecast</b>, which is the baseline that matters. If this '+
+      'model cannot beat the number the game gives away for free, it is decoration.</p>'+
+      status+
+      '<div class="msg info">No completed gameweek has been marked yet'+
+      (A.pending&&A.pending.length?' — gameweek '+A.pending.join(", ")+' recorded, waiting '+
+       'for the results to finalise':'')+'. The first verdict appears once a recorded '+
+      'gameweek finishes.</div>';
+  }
+  var C=A.combined||{};
+  var beat=C.beatsFpl;
+  var kpi='<div class="spendgrid">'+
+    '<div class="spendcell"><b>Average error</b><span>'+C.mae+'</span><small>points per player, '+
+      'across '+C.n+' player-gameweeks</small></div>'+
+    '<div class="spendcell"><b>FPL’s own error</b><span>'+C.fplMae+'</span><small>same players, '+
+      'same weeks</small></div>'+
+    '<div class="spendcell'+(beat?' good':' bad')+'"><b>'+(beat?'Better by':'Worse by')+'</b><span>'+
+      Math.abs(C.edge).toFixed(2)+'</span><small>'+(beat?'this model is closer':
+      'FPL’s free number is closer')+'</small></div>'+
+    '<div class="spendcell"><b>Correlation</b><span>'+(C.corr==null?"—":C.corr)+'</span>'+
+      '<small>predicted against actual</small></div></div>';
+  var wk='<table class="bands"><tr><th>GW</th><th>Players</th><th>This model</th>'+
+    '<th>FPL</th><th>Verdict</th></tr>'+A.weeks.map(function(w){
+      var o=w.overall||{}; var better=o.mae<o.fplMae;
+      return '<tr><td>GW'+w.gw+'</td><td>'+o.n+'</td><td><b>'+o.mae+'</b></td><td>'+o.fplMae+
+        '</td><td><span class="'+(better?'winA':'winB')+'">'+(better?'model':'FPL')+
+        ' by '+Math.abs(o.mae-o.fplMae).toFixed(2)+'</span></td></tr>';
+    }).join("")+'</table>';
+  var lastW=A.weeks[A.weeks.length-1];
+  var cal=(lastW.calibration||[]);
+  var src=lastW.bySource||{};
+  var srcHtml=(src.market&&src.model)?
+    '<h4 class="subhead">Do the betting odds earn their keep?</h4>'+
+    '<table class="bands"><tr><th>Fixture priced by</th><th>Players</th><th>Average error</th></tr>'+
+    '<tr><td>The betting market</td><td>'+src.market.n+'</td><td><b>'+src.market.mae+'</b></td></tr>'+
+    '<tr><td>The results model</td><td>'+src.model.n+'</td><td><b>'+src.model.mae+'</b></td></tr>'+
+    '</table><p class="dim">'+(src.market.mae<src.model.mae?
+      'Market-priced fixtures are predicted more accurately, which is the odds feed paying for itself.':
+      'No advantage to the market-priced fixtures in this sample — worth watching before renewing the odds budget.')+
+    '</p>':'';
+  var adv='';
+  var me=(lastW.managers||{})[String(viewEntry)];
+  if(me){
+    var bits=[];
+    if(me.captain) bits.push('<tr><td>Captain</td><td>'+(me.captain.agreed?
+      'It agreed with your pick':'It wanted '+esc((P(me.captain.advised)||{}).name||"?")+
+      ', you had '+esc((P(me.captain.actual)||{}).name||"?"))+'</td><td><b>'+
+      (me.captain.swing>0?"+":"")+me.captain.swing+'</b> pts</td></tr>');
+    if(me.lineup) bits.push('<tr><td>Starting eleven</td><td>Its eleven scored '+
+      me.lineup.advisedPoints+', yours scored '+me.lineup.yourPoints+'</td><td><b>'+
+      (me.lineup.swing>0?"+":"")+me.lineup.swing+'</b> pts</td></tr>');
+    if(me.transferHitRate!=null) bits.push('<tr><td>Transfers suggested</td><td>'+
+      Math.round(me.transferHitRate*100)+'% of them gained points that week</td><td></td></tr>');
+    if(bits.length) adv='<h4 class="subhead">Was its advice worth taking, in GW'+lastW.gw+'?</h4>'+
+      '<table class="bands"><tr><th>Call</th><th>What happened</th><th>Swing</th></tr>'+
+      bits.join("")+'</table>';
+  }
+  return '<h3>Was any of it right?</h3>'+
+    '<p>Forecasts are written to a file before each deadline and marked once the football '+
+    'has been played. The number that matters is not the error on its own but the error '+
+    '<b>against FPL’s own published forecast</b> — a free baseline this model has to beat '+
+    'to justify existing.</p>'+status+kpi+
+    '<div class="msg '+(beat?'good':'warn')+'"><b>'+
+    (beat?'It is beating FPL’s own forecast':'FPL’s own forecast is currently better')+
+    '</b> by '+Math.abs(C.edge).toFixed(2)+' points of average error across '+
+    C.gameweeks.length+' gameweek'+(C.gameweeks.length===1?'':'s')+'. '+
+    (C.gameweeks.length<6?'That is far too small a sample to mean anything yet — a few '+
+     'gameweeks of noise can flip it either way. Treat it as a running tally, not a verdict.':
+     'Still a modest sample, but starting to be worth something.')+'</div>'+
+    '<h4 class="subhead">Every prediction against what actually happened</h4>'+
+    '<p class="dim">Each faint dot is one player in one gameweek. The line is the average '+
+    'result for each level of prediction — if the model were perfectly calibrated it would '+
+    'sit on the dashed diagonal. Above the line means the model is under-predicting.</p>'+
+    scatterSVG(C.scatter||[],cal)+
+    (cal.length?'<table class="bands"><tr><th>Predicted</th><th>Players</th>'+
+      '<th>Actually averaged</th></tr>'+cal.map(function(b){
+        return '<tr><td>'+b.lo+(b.hi?'–'+b.hi:'+')+'</td><td>'+b.n+'</td><td><b>'+
+          b.actual+'</b></td></tr>'}).join("")+'</table>':'')+
+    '<h4 class="subhead">Week by week</h4>'+wk+srcHtml+adv;
+}
+
 function renderModel(){
   var w=D.meta.model, mm=M(), b=mm.budget;
   var capped=Object.keys(mm.clubCounts).filter(function(k){return mm.clubCounts[k]>=3});
@@ -5759,6 +6508,7 @@ function renderModel(){
   'hand-built heuristic, not a trained model, so treat it as a way of ranking options and '+
   'surfacing things you might miss — not as a points forecast.</p>'+
 
+  accuracyHTML()+
   '<h3>The assistant, and what it costs</h3>'+
   (function(){
     var c=(D.meta&&D.meta.chat)||{};
