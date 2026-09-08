@@ -2804,7 +2804,28 @@ def chat_context(payload, entry):
              "Budget: %.1fm squad value, %.1fm in the bank."
              % (mm["budget"]["squadValue"], mm["budget"]["bank"]) if mm.get("budget") else "",
              "Free transfers assumed: %s (the public API does not report the real number)."
-             % mm.get("freeTransfers", 1),
+             % mm.get("freeTransfers", 1)]
+
+    # The armband deserves its own sentence. It was previously only a bracketed
+    # tag inside a squad line, while the word "Captain" appeared prominently a
+    # few lines below against the model's RECOMMENDATION -- so the two were easy
+    # to confuse and easy to miss entirely.
+    cap_pick = next((pk for pk in mm.get("picks", []) if pk.get("isCap")), None)
+    vice_pick = next((pk for pk in mm.get("picks", []) if pk.get("isVice")), None)
+    if cap_pick:
+        lines.append(
+            "CURRENTLY WEARING THE ARMBAND: %s is captain%s. This is what the manager has "
+            "actually set%s -- do not confuse it with the recommendation further down."
+            % (nm(cap_pick["id"]),
+               " and %s is vice-captain" % nm(vice_pick["id"]) if vice_pick else "",
+               (", as of gameweek %s, which has now finished; it carries over unless it "
+                "is changed before the next deadline" % mm.get("chipGw"))
+               if mm.get("chipSpent") else " for gameweek %s, which is live" % mm.get("chipGw")))
+    else:
+        lines.append("CURRENTLY WEARING THE ARMBAND: unknown -- the game has not returned "
+                     "a team selection for this manager.")
+
+    lines += [
              "", "SQUAD (xPts next match / next five / price / sells for), then his fixtures and \
 his last four appearances with points scored:"]
     for pk in mm.get("picks", []):
@@ -2836,11 +2857,13 @@ his last four appearances with points scored:"]
         lines.append("        fixtures %s | recent %s" % (fx, recent))
 
     if L:
-        lines += ["", "WHAT THE MODEL WOULD FIELD THIS WEEK: %s, %s expected points "
-                      "(%s with the captain doubled)."
+        lines += ["", "WHAT THE MODEL WOULD FIELD THIS WEEK (a recommendation, not the "
+                      "current team): %s, %s expected points (%s with the armband doubled)."
                   % (L.get("formation"), L.get("xiPoints"), L.get("withCaptain")),
-                  "  Captain %s, vice %s. Bench in order: %s."
+                  "  It would give the armband to %s, with %s as vice%s. Bench in order: %s."
                   % (nm(L.get("captain")), nm(L.get("vice")),
+                     " -- which is who has it already" if L.get("capIsCurrent")
+                     else " -- a CHANGE from the current captain",
                      ", ".join(nm(i) for i in L.get("bench", [])) or "-"),
                   "  Against what is currently picked that is worth %s points."
                   % L.get("gain")]
